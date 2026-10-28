@@ -8,7 +8,7 @@ first collector split the batch from a Python executor, which cost 100-900 us
 per call and made Pinocchio look 20x slower between B=16 and B=32.
 """
 import ctypes
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import importlib.metadata
 import os

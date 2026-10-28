@@ -1384,7 +1384,7 @@ REGIONS = (
 def main() -> int:
     check = "--check" in sys.argv
     p = template_path()
-    src = p.read_text()
+    src = p.read_text(encoding="utf-8")
     new = src
     for begin, end, gen in REGIONS:
         if begin not in new or end not in new:
@@ -1401,7 +1401,7 @@ def main() -> int:
             return 1
         print("generated blocks up to date")
         return 0
-    p.write_text(new)
+    p.write_text(new, encoding="utf-8", newline="\n")
     print(f"rewrote generated regions ({len(GENERATED_KEYS)} bodies + "
           f"{len(CEIL_ROWS)} ceiling branches + {len(TORCH_SURFACE_KEYS)} torch ops + "
           f"{len(JAX_SURFACE_KEYS)} jax handlers + {len(TORCH_TABLE_ORDER)}-row op table)")

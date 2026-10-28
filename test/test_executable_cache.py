@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import threading
 from pathlib import Path
 
@@ -16,15 +17,18 @@ import pytest
 from test.cuda_equivalents import cuda_harness
 from test.cuda_equivalents.executable_cache import cached_nvcc_executable
 
-_FAKE_NVCC = """#!/usr/bin/env bash
-if [ "$1" = "--version" ]; then echo "${FAKE_NVCC_VERSION:-fake nvcc 1.0}"; exit 0; fi
-echo "$*" >> "$FAKE_NVCC_LOG"
-[ -n "$FAKE_NVCC_SLEEP" ] && sleep "$FAKE_NVCC_SLEEP"
-[ -n "$FAKE_NVCC_FAIL" ] && { echo "boom" >&2; exit 1; }
-out=""; prev=""
-for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
-src="${@: -1}"
-sha256sum "$src" grid.cuh > "$out"
+_FAKE_NVCC = """import hashlib, os, pathlib, sys, time
+if sys.argv[1:] == ['--version']:
+    print(os.environ.get('FAKE_NVCC_VERSION', 'fake nvcc 1.0'))
+    sys.exit(0)
+with open(os.environ['FAKE_NVCC_LOG'], 'a') as log:
+    log.write(' '.join(sys.argv[1:]) + '\\n')
+time.sleep(float(os.environ.get('FAKE_NVCC_SLEEP', '0')))
+if os.environ.get('FAKE_NVCC_FAIL'):
+    sys.exit('boom')
+out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+out.write_text('\\n'.join(hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+                         for p in [sys.argv[-1], 'grid.cuh']))
 """
 
 
@@ -32,8 +36,12 @@ sha256sum "$src" grid.cuh > "$out"
 def toolkit(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    nvcc = bin_dir / "nvcc"
-    nvcc.write_text(_FAKE_NVCC)
+    nvcc = bin_dir / ("nvcc.cmd" if os.name == "nt" else "nvcc")
+    if os.name == "nt":
+        (bin_dir / 'nvcc.py').write_text(_FAKE_NVCC)
+        nvcc.write_text(f'@echo off\n"{sys.executable}" "%~dp0nvcc.py" %*\n')
+    else:
+        nvcc.write_text(f'#!{sys.executable}\n' + _FAKE_NVCC)
     nvcc.chmod(nvcc.stat().st_mode | stat.S_IXUSR)
     log = tmp_path / "nvcc.log"
     log.write_text("")

@@ -28,10 +28,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 _grid_rbd = pytest.importorskip("grid_rbd", reason="grid-rbd not installed")
 
-_URDF = (
-    Path.home()
-    / ".cache/robot_descriptions/drake/manipulation/models/iiwa_description/urdf/iiwa14_primitive_collision.urdf"
-)
+from grid_assets import robot_urdf
+_URDF = robot_urdf("iiwa14")
 if not _URDF.exists():
     pytest.skip(f"iiwa14 URDF fixture not present at {_URDF}", allow_module_level=True)
 

@@ -21,7 +21,7 @@ hundreds of names, so most of a dev box's store is unreferenced.
 from __future__ import annotations
 
 import argparse
-import fcntl
+from grid_codegen import _filelock as fcntl
 import os
 import shutil
 import sys
@@ -58,7 +58,7 @@ def gc_cache(cache_dir: str | Path | None = None, *, execute: bool = False,
     if not store.is_dir():
         return report
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with (cache_dir / "manifest.lock").open("a+") as lock:
+    with (cache_dir / "manifest.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             referenced = {e.get("cache_key") for e in load_manifest(cache_dir).get("robots", {}).values()}
@@ -75,7 +75,7 @@ def gc_cache(cache_dir: str | Path | None = None, *, execute: bool = False,
             if bykey.is_dir():
                 for p in bykey.iterdir():
                     try:
-                        target = p.read_text().strip()
+                        target = p.read_text(encoding="utf-8").strip()
                     except OSError:
                         continue
                     if target in gone or not (store / target / "robot.so").exists():

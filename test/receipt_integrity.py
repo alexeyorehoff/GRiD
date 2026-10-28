@@ -169,7 +169,7 @@ def receipt_row_for_arch(arch: int, table: list[ReceiptRow] | None = None) -> Re
             return row
     known = ', '.join(f'{r.sm} ({r.label})' for r in table)
     raise ValueError(f'no receipt row for sm_{arch}: add a row for this architecture to '
-                     f'{RECEIPTS_TABLE.relative_to(REPO_ROOT)} (known: {known})')
+                     f'{RECEIPTS_TABLE.relative_to(REPO_ROOT).as_posix()} (known: {known})')
 
 
 def receipt_arch(receipt: dict) -> int | None:

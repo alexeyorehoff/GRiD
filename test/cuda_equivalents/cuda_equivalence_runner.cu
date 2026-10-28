@@ -374,10 +374,22 @@ static void grid_runner_register_run_tokens() {
 #endif  // !GRID_RUNNER_SKIP_EEPOSE_GRADIENTS
 #if !GRID_RUNNER_SKIP_GRADIENTS
 #if RUN_INVERSE_DYNAMICS_GRADIENT
+#if GRID_CUDA_FLOATING_BASE
+    grid_runner_set_smem_or_skip(
+        static_cast<grid_runner_grad_kernel_t<T>>(&grid::inverse_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>),
+        "inverse_dynamics_gradient", grid::INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>());
+#else
     gpuErrchk(grid::init_grid_kernel_attr_inverse_dynamics_gradient_checked<T>());
 #endif
+#endif
 #if RUN_FORWARD_DYNAMICS_GRADIENT
+#if GRID_CUDA_FLOATING_BASE
+    grid_runner_set_smem_or_skip(
+        static_cast<grid_runner_grad_kernel_t<T>>(&grid::forward_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>),
+        "forward_dynamics_gradient", grid::FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>());
+#else
     gpuErrchk(grid::init_grid_kernel_attr_forward_dynamics_gradient_checked<T>());
+#endif
 #endif
 #endif  // !GRID_RUNNER_SKIP_GRADIENTS
 }
@@ -693,7 +705,9 @@ void run() {
     if (floating_algorithm_requested("inverse_dynamics_gradient_q") ||
         floating_algorithm_requested("inverse_dynamics_gradient_qd")) {
         maybe_poison_smem();
-        grid::inverse_dynamics_gradient_kernel<T><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::inverse_dynamics_gradient_kernel<T>), "inverse_dynamics_gradient"), grid::INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(
+        // Match the floating FD runner: use the existing workspace tier so the
+        // default 96-KiB codegen budget does not constrain the test GPU.
+        grid::inverse_dynamics_gradient_kernel<T, grid::TIER_MINIMAL><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::inverse_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>), "inverse_dynamics_gradient"), grid::INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>()>>>(
             d_grad,
             hd_data->d_workspace,
             d_q_qd,
@@ -720,7 +734,7 @@ void run() {
     if (floating_algorithm_requested("forward_dynamics_gradient_q") ||
         floating_algorithm_requested("forward_dynamics_gradient_qd")) {
         maybe_poison_smem();
-        grid::forward_dynamics_gradient_kernel<T><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::forward_dynamics_gradient_kernel<T>), "forward_dynamics_gradient"), grid::FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(
+        grid::forward_dynamics_gradient_kernel<T, grid::TIER_MINIMAL><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::forward_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>), "forward_dynamics_gradient"), grid::FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>()>>>(
             d_grad,
             hd_data->d_workspace,
             d_q_qd_u,
@@ -786,7 +800,7 @@ void run() {
 #if !GRID_RUNNER_SKIP_GRADIENTS
 #if RUN_INVERSE_DYNAMICS_GRADIENT
         maybe_poison_smem();
-        grid::inverse_dynamics_gradient_kernel<T><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::inverse_dynamics_gradient_kernel<T>), "inverse_dynamics_gradient"), grid::INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(
+        grid::inverse_dynamics_gradient_kernel<T, grid::TIER_MINIMAL><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::inverse_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>), "inverse_dynamics_gradient"), grid::INVERSE_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>()>>>(
             d_grad, hd_data->d_workspace, d_q_qd, grid::NUM_JOINTS + grid::NUM_VEL,
             d_f_ext_active, d_robot_model, gravity, 1
         );
@@ -800,7 +814,7 @@ void run() {
 
 #if RUN_FORWARD_DYNAMICS_GRADIENT
         maybe_poison_smem();
-        grid::forward_dynamics_gradient_kernel<T><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::forward_dynamics_gradient_kernel<T>), "forward_dynamics_gradient"), grid::FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>()>>>(
+        grid::forward_dynamics_gradient_kernel<T, grid::TIER_MINIMAL><<<1, grid_runner_launch_threads(static_cast<grid_runner_grad_kernel_t<T>>(&grid::forward_dynamics_gradient_kernel<T, grid::TIER_MINIMAL>), "forward_dynamics_gradient"), grid::FORWARD_DYNAMICS_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T, grid::TIER_MINIMAL>()>>>(
             d_grad, hd_data->d_workspace, d_q_qd_u, 3 * grid::NUM_JOINTS,
             d_f_ext_active, d_robot_model, gravity, 1
         );

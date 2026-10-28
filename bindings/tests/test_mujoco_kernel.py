@@ -767,6 +767,14 @@ def test_native_mjx_plant_step_gradient_matches_oracle(go2_floating, it_name):
                 pin_dAB[b], Minv[b], qdd[b, :nv], qd_pin[b, :nv], u_pin[b, :nv], R[b], dt, it_name, layout)
         assert np.allclose(native, exp, rtol=5e-3, atol=5e-2), \
             f"plant_step_gradient mjx != oracle ({it_name}): max|d|={np.abs(native-exp).max():.3e}"
+        # Spill bands belong to live blocks, not batch rows. One workspace slot
+        # must safely grid-stride over B=2 in both output conventions.
+        with h.context(workspace_slots=1) as limited:
+            assert limited.device_profile["workspace_slots"] == 1
+            np.testing.assert_array_equal(limited.plant_step_gradient(
+                x, u_nv, dt, integrator_type=it_name, _convention="mujoco"), native)
+            np.testing.assert_array_equal(limited.plant_step_gradient(
+                x_pin, u_pin[:, :nv].astype(np.float32), dt, integrator_type=it_name), pin_dAB)
 
 
 @pytest.mark.skipif(not _has_cuda(), reason="needs nvcc + CUDA GPU")

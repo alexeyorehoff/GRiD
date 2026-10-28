@@ -118,7 +118,7 @@ __global__ void centroidal_kernel(const T *g_q, const T *g_qd,
 }
 
 // ----- D1c: drive the grid_plant CoM / momentum costs -----
-template <typename T>
+template <typename T, int RESOURCE_TIER>
 __global__ void cost_kernel(const T *g_q, const T *g_qd,
                             const grid::robotModel<T> *d_robotModel,
                             unsigned char *d_workspace,
@@ -166,15 +166,15 @@ __global__ void cost_kernel(const T *g_q, const T *g_qd,
     __syncthreads();
 
     // ---- momentum cost ----
-    grid_plant::momentum_cost<T>(s_out, s_q, s_qd, s_hdes, s_mW, s_cost_scratch, d_robotModel, d_workspace);
+    grid_plant::momentum_cost<T, false, false, RESOURCE_TIER>(s_out, s_q, s_qd, s_hdes, s_mW, s_cost_scratch, d_robotModel, d_workspace);
     __syncthreads(); if (tid == 0) o_mv[0] = s_out[0]; __syncthreads();
     for (int i = tid; i < NM; i += nth) s_grad[i] = static_cast<T>(12345);
     __syncthreads();
-    grid_plant::momentum_cost_gradient<T, false>(s_grad, s_q, s_qd, s_hdes, s_mW, s_cost_scratch, d_robotModel, d_workspace);
+    grid_plant::momentum_cost_gradient<T, false, false, RESOURCE_TIER>(s_grad, s_q, s_qd, s_hdes, s_mW, s_cost_scratch, d_robotModel, d_workspace);
     __syncthreads();
     for (int i = tid; i < NM; i += nth) o_mg[i] = s_grad[i];
     __syncthreads();
-    grid_plant::momentum_cost_hessian<T, false>(s_hess, s_q, s_qd, s_mW, s_cost_scratch, d_robotModel, d_workspace);
+    grid_plant::momentum_cost_hessian<T, false, false, RESOURCE_TIER>(s_hess, s_q, s_qd, s_mW, s_cost_scratch, d_robotModel, d_workspace);
     __syncthreads();
     for (int i = tid; i < NM * NM; i += nth) o_mh[i] = s_hess[i];
     __syncthreads();
@@ -182,6 +182,23 @@ __global__ void cost_kernel(const T *g_q, const T *g_qd,
 
 template <typename T>
 T *dmalloc(int count) { T *p; cudaMalloc(&p, count * sizeof(T)); return p; }
+
+template <typename T, int RESOURCE_TIER>
+bool launch_cost(const T *q, const T *qd, const grid::robotModel<T> *model,
+                 unsigned char *workspace, int threads, int cap,
+                 T *cv, T *cg, T *ch, T *mv, T *mg, T *mh) {
+    size_t bytes = grid::COM_DYNAMIC_SHARED_MEM_BYTES<T>();
+    if (grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>() > bytes) bytes = grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>();
+    if (grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>() > bytes)
+        bytes = grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>();
+    cudaFuncAttributes attrs;
+    gpuErrchk(cudaFuncGetAttributes(&attrs, cost_kernel<T, RESOURCE_TIER>));
+    if (bytes + attrs.sharedSizeBytes > (size_t)cap) return false;
+    gpuErrchk(cudaFuncSetAttribute(cost_kernel<T, RESOURCE_TIER>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+    cost_kernel<T, RESOURCE_TIER><<<1, threads, bytes>>>(q, qd, model, workspace, cv, cg, ch, mv, mg, mh);
+    gpuErrchkKernel();
+    return true;
+}
 template <typename T>
 void dcopy_out(const std::string &name, T *dptr, int rows, int cols) {
     std::vector<T> h(rows * cols);
@@ -227,18 +244,11 @@ void run() {
         const int v = std::atoi(e);
         if (v > 0) nthreads = v;
     }
-    // The centroidal device functions compose the grid:: XmatsHom kinematics
-    // + EE-Jacobian arena via auto-allocating wrappers (extern __shared__); size
-    // each kernel's dynamic smem to the max device requirement it composes.
-    // generalized_gravity / nonlinear_effects share the ID_BIAS arena; com /
-    // ccrba / energy each have their own. Size to the max over all five.
-    size_t dyn = grid::COM_DYNAMIC_SHARED_MEM_BYTES<T>();
-    if (grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>() > dyn) dyn = grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>();
-    if (grid::ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>() > dyn) dyn = grid::ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>();
+    // The two kernels compose different arenas. In particular the cost
+    // kernel's static Hessian must also fit beside its dynamic scratch.
+    size_t dyn = grid::CENTROIDAL_DEVICE_SHARED_MEM_BYTES<T>();
     if (grid::INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>() > dyn) dyn = grid::INVERSE_DYNAMICS_BIAS_DYNAMIC_SHARED_MEM_BYTES<T>();
-    if (grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>() > dyn) dyn = grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T>();
-    cudaFuncSetAttribute(centroidal_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn);
-    cudaFuncSetAttribute(cost_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn);
+    gpuErrchk(cudaFuncSetAttribute(centroidal_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn));
 
     centroidal_kernel<T><<<1, nthreads, dyn>>>(g_q, g_qd, d_robotModel, gravity,
         o_grav, o_nle, o_com, o_jcom, o_A, o_h, o_energy);
@@ -248,9 +258,16 @@ void run() {
     // cudaPeekAtLastError() + cudaDeviceSynchronize() and aborts on any error.
     gpuErrchkKernel();
 
-    cost_kernel<T><<<1, nthreads, dyn>>>(g_q, g_qd, d_robotModel, workspace,
-        o_cv, o_cg, o_ch, o_mv, o_mg, o_mh);
-    gpuErrchkKernel();
+    int device = 0, cap = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    gpuErrchk(cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    if (!launch_cost<T, grid::TIER_SHARED>(g_q, g_qd, d_robotModel, workspace, nthreads, cap,
+                                         o_cv, o_cg, o_ch, o_mv, o_mg, o_mh) &&
+        !launch_cost<T, grid::TIER_LITE>(g_q, g_qd, d_robotModel, workspace, nthreads, cap,
+                                       o_cv, o_cg, o_ch, o_mv, o_mg, o_mh) &&
+        !launch_cost<T, grid::TIER_MINIMAL>(g_q, g_qd, d_robotModel, workspace, nthreads, cap,
+                                          o_cv, o_cg, o_ch, o_mv, o_mg, o_mh))
+        gpuErrchk(cudaErrorInvalidConfiguration);
 
     // D1b blocks
     dcopy_out("gen_gravity", o_grav, 1, NV);

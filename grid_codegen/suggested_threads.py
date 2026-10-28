@@ -130,10 +130,14 @@ def _strip_branches(text: str) -> str:
     out = []
     i = 0
     n = len(text)
+    # Matching against text[i:] copied the remaining function body once per
+    # character (quadratic on large generated robot kernels). A positional
+    # match keeps the same suffix-start semantics without copying the suffix.
+    branch = re.compile(r"if\s*(constexpr\s*)?\(")
     while i < n:
-        m = re.match(r"\bif\s*(constexpr\s*)?\(", text[i:])
+        m = branch.match(text, i)
         if m:
-            j = i + m.end() - 1
+            j = m.end() - 1
             depth = 0
             while j < n:
                 if text[j] == "(":

@@ -9,7 +9,7 @@ import it (see run_split_suite._shard_fingerprint_paths).
 """
 from __future__ import annotations
 
-import fcntl
+from grid_codegen import _filelock as fcntl
 import json
 import os
 import re

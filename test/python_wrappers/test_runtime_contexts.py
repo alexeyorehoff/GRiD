@@ -12,6 +12,7 @@ artifacts (fd + id) so the module stays minutes, not hours.
 from __future__ import annotations
 
 import sys
+import shutil
 import threading
 from pathlib import Path
 
@@ -107,7 +108,13 @@ def test_explicit_context_carves_its_own_slab_and_a_tiny_slab_fails_cleanly(iiwa
     r = iiwa._runner
     default_used_before = r.device_pool_used()
     bytes_needed = r.device_pool_bytes(4)
-    cuda = ctypes.CDLL("libcudart.so")
+    cuda_library = (next(Path(shutil.which("nvcc")).parent.glob("cudart64_*.dll"))
+                    if sys.platform == "win32" else "libcudart.so")
+    cuda = ctypes.CDLL(str(cuda_library))
+    cuda.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+    cuda.cudaMalloc.restype = ctypes.c_int
+    cuda.cudaFree.argtypes = [ctypes.c_void_p]
+    cuda.cudaFree.restype = ctypes.c_int
     ptr = ctypes.c_void_p()
     assert cuda.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(bytes_needed)) == 0
     try:

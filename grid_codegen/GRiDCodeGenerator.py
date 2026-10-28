@@ -372,6 +372,7 @@ class GRiDCodeGenerator:
         self.gen_add_code_line("#include <stdlib.h>")
         self.gen_add_code_line("#include <string.h>")
         self.gen_add_code_line("#include <time.h>")
+        self.gen_add_code_line("#include <chrono>")
         self.gen_add_code_line("#include <cuda_runtime.h>")
         if not getattr(self, "vendor_glass", True):
             self.gen_add_code_line("#include \"glass.cuh\"  // vendor_glass=False: the consumer's top-level GLASS (-I<GLASS root>)")
@@ -391,6 +392,15 @@ class GRiDCodeGenerator:
         # then any #defines
         self.gen_add_code_lines(["// single kernel timing helper code", \
             "#define time_delta_us_timespec(start,end) (1e6*static_cast<double>(end.tv_sec - start.tv_sec)+1e-3*static_cast<double>(end.tv_nsec - start.tv_nsec))"])
+        self.gen_add_code_lines([
+            "// Monotonic host timer, including native Windows/MSVC.",
+            "inline void grid_clock_now(struct timespec *value) {",
+            "    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(",
+            "        std::chrono::steady_clock::now().time_since_epoch()).count();",
+            "    value->tv_sec = static_cast<decltype(value->tv_sec)>(ns / 1000000000);",
+            "    value->tv_nsec = static_cast<decltype(value->tv_nsec)>(ns % 1000000000);",
+            "}",
+        ])
         self.gen_add_code_line("")
         self.gen_add_code_line("#define XIMAT_SIZE 36")
 
@@ -1207,11 +1217,11 @@ class GRiDCodeGenerator:
         if fragments_dir is not None:
             os.makedirs(fragments_dir, exist_ok=True)
             for _frag_name, _frag_text in self.header_fragments:
-                with open(os.path.join(fragments_dir, "grid_frag_" + _frag_name + ".cuh"), "w") as _f:
+                with open(os.path.join(fragments_dir, "grid_frag_" + _frag_name + ".cuh"), "w", encoding="utf-8") as _f:
                     _f.write(_frag_text)
         # then output to a file
         if output_path is None:
             output_path = self.file_namespace + ".cuh"
-        file = open(output_path, "w")
+        file = open(output_path, "w", encoding="utf-8")
         file.write(self.code_str)
         file.close()

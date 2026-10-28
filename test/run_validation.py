@@ -7,7 +7,7 @@ restores stale header-key evidence. No clock/governor changes and no timing.
 from __future__ import annotations
 
 import argparse
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import json
 import os
@@ -114,24 +114,24 @@ def run_driver(command, *, log, lock):
     def interrupt(signum, frame):
         raise KeyboardInterrupt(f'received signal {signum}')
     signal.signal(signal.SIGTERM, interrupt)
+    from test.processes import start_process_tree, terminate_process_tree
     process = None
+    owned_job = None
     try:
-        process = subprocess.Popen(command, cwd=ROOT, env=validation_env(),
+        process, owned_job = start_process_tree(command, cwd=ROOT, env=validation_env(),
                                    stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, pass_fds=(lock.fileno(),))
+                                   start_new_session=True,
+                                   pass_fds=() if os.name == 'nt' else (lock.fileno(),))
         return subprocess.CompletedProcess(command, process.wait())
     except BaseException:
         # The split driver's handler shuts down its separately grouped compilers
         # and pytest workers. Do not release the shared lock before it has exited.
         if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            terminate_process_tree(process, owned_job, timeout=30)
         raise
     finally:
+        if owned_job is not None:
+            owned_job.Close()
         signal.signal(signal.SIGTERM, previous)
 
 

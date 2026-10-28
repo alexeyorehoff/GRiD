@@ -34,37 +34,36 @@ constexpr int EE = 0;
 extern __shared__ __align__(16) T s_dyn[];
 
 __global__ void grad_kernel(T *d_grad, const T *d_q, const T *d_pdes, const T *d_W,
-                            const grid::robotModel<T> *d_rm) {
-    __shared__ T s_q[NQ], s_pdes[3], s_W[3], s_pose[6 * NEE], s_grad_out[NX];
-    __shared__ T s_dee[6 * NV * NEE];
+                            const grid::robotModel<T> *d_rm, T *d_ee) {
+    __shared__ T s_q[NQ], s_pdes[3], s_W[3];
+    T *s_pose = d_ee, *s_dee = d_ee + 6 * NEE;
     for (int i = threadIdx.x; i < NQ; i += blockDim.x) s_q[i] = d_q[i];
     for (int i = threadIdx.x; i < 3;  i += blockDim.x) { s_pdes[i] = d_pdes[i]; s_W[i] = d_W[i]; }
     __syncthreads();
-    grid_plant::ee_pos_cost_gradient<T, EE, false>(s_grad_out, s_q, s_pdes, s_W, s_pose, s_dee, s_dyn, d_rm);
-    __syncthreads();
-    for (int i = threadIdx.x; i < NX; i += blockDim.x) d_grad[i] = s_grad_out[i];
+    grid_plant::ee_pos_cost_gradient<T, EE, false>(d_grad, s_q, s_pdes, s_W, s_pose, s_dee, s_dyn, d_rm);
 }
 
 template <bool GN>
 __global__ void hess_kernel(T *d_hess, const T *d_q, const T *d_pdes, const T *d_W,
-                            const grid::robotModel<T> *d_rm) {
-    __shared__ T s_q[NQ], s_pdes[3], s_W[3], s_pose[6 * NEE];
-    __shared__ T s_dee[6 * NV * NEE], s_d2ee[6 * NV * NV * NEE], s_hess[NX * NX];
+                            const grid::robotModel<T> *d_rm, T *d_ee) {
+    __shared__ T s_q[NQ], s_pdes[3], s_W[3];
+    T *s_pose = d_ee, *s_dee = d_ee + 6 * NEE;
+    T *s_d2ee = s_dee + 6 * NV * NEE;
     for (int i = threadIdx.x; i < NQ; i += blockDim.x) s_q[i] = d_q[i];
     for (int i = threadIdx.x; i < 3;  i += blockDim.x) { s_pdes[i] = d_pdes[i]; s_W[i] = d_W[i]; }
     __syncthreads();
-    grid_plant::ee_pos_cost_hessian<T, EE, false, GN>(s_hess, s_q, s_pdes, s_W,
+    grid_plant::ee_pos_cost_hessian<T, EE, false, GN>(d_hess, s_q, s_pdes, s_W,
                                                       s_pose, s_dee, s_d2ee, s_dyn, d_rm);
-    __syncthreads();
-    for (int i = threadIdx.x; i < NX * NX; i += blockDim.x) d_hess[i] = s_hess[i];
 }
 
 static size_t g_grad_dyn = 0, g_hess_dyn = 0;
+static T *g_ee_workspace = nullptr;
 
 static void grad_at(const std::vector<T> &q, T *d_buf, T *d_q, T *d_pdes, T *d_W,
                     const grid::robotModel<T> *d_rm, std::vector<T> &out) {
     cudaMemcpy(d_q, q.data(), NQ * sizeof(T), cudaMemcpyHostToDevice);
-    grad_kernel<<<1, 64, g_grad_dyn>>>(d_buf, d_q, d_pdes, d_W, d_rm);
+    grad_kernel<<<1, 64, g_grad_dyn>>>(d_buf, d_q, d_pdes, d_W, d_rm, g_ee_workspace);
+    gpuErrchk(cudaPeekAtLastError());
     cudaMemcpy(out.data(), d_buf, NX * sizeof(T), cudaMemcpyDeviceToHost);
 }
 
@@ -77,9 +76,12 @@ int main() {
     // opt-in cap so big-joint-count robots fit.
     g_grad_dyn = grid::END_EFFECTOR_POSE_GRADIENT_DYNAMIC_SHARED_MEM_BYTES<T>();
     g_hess_dyn = grid::END_EFFECTOR_POSE_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>();
-    cudaFuncSetAttribute(grad_kernel,         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_grad_dyn);
-    cudaFuncSetAttribute(hess_kernel<false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_hess_dyn);
-    cudaFuncSetAttribute(hess_kernel<true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_hess_dyn);
+    gpuErrchk(cudaFuncSetAttribute(grad_kernel,         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_grad_dyn));
+    gpuErrchk(cudaFuncSetAttribute(hess_kernel<false>,  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_hess_dyn));
+    gpuErrchk(cudaFuncSetAttribute(hess_kernel<true>,   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)g_hess_dyn));
+    // Keep the large caller-owned EE derivatives in global workspace. The
+    // shared scratch remains available to the analytic computation itself.
+    gpuErrchk(cudaMalloc(&g_ee_workspace, (6 * NEE + 6 * NV * NEE + 6 * NV * NV * NEE) * sizeof(T)));
 
     // Deterministic mid-range configuration + a FAR target so the residual (and
     // thus the curvature term) is large and unambiguous.
@@ -96,8 +98,10 @@ int main() {
     cudaMemcpy(d_W, W, 3 * sizeof(T), cudaMemcpyHostToDevice);
     cudaMemcpy(d_q, q.data(), NQ * sizeof(T), cudaMemcpyHostToDevice);
 
-    hess_kernel<false><<<1, 64, g_hess_dyn>>>(d_hess_n, d_q, d_pdes, d_W, d_rm);   // Newton (default)
-    hess_kernel<true ><<<1, 64, g_hess_dyn>>>(d_hess_gn, d_q, d_pdes, d_W, d_rm);  // Gauss-Newton
+    hess_kernel<false><<<1, 64, g_hess_dyn>>>(d_hess_n, d_q, d_pdes, d_W, d_rm, g_ee_workspace);   // Newton (default)
+    gpuErrchk(cudaPeekAtLastError());
+    hess_kernel<true ><<<1, 64, g_hess_dyn>>>(d_hess_gn, d_q, d_pdes, d_W, d_rm, g_ee_workspace);  // Gauss-Newton
+    gpuErrchk(cudaPeekAtLastError());
     std::vector<T> Hn(NX * NX), Hgn(NX * NX);
     cudaMemcpy(Hn.data(),  d_hess_n,  NX * NX * sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpy(Hgn.data(), d_hess_gn, NX * NX * sizeof(T), cudaMemcpyDeviceToHost);

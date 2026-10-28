@@ -22,7 +22,7 @@ from grid_codegen.wrapper_plant_gen import (
 
 
 def _file_slice(surface: str) -> str:
-    text = Path(_TEMPLATE).read_text()
+    text = Path(_TEMPLATE).read_text(encoding="utf-8")
     b, e = plant_tail_spans(text)[surface]
     return "\n".join(text.split("\n")[b:e + 1]) + "\n"
 
@@ -42,7 +42,7 @@ def test_torch_plant_tail_matches_emitter():
 
 
 def test_spans_are_disjoint_and_ordered():
-    text = Path(_TEMPLATE).read_text()
+    text = Path(_TEMPLATE).read_text(encoding="utf-8")
     spans = plant_tail_spans(text)
     jb, je = spans["jax"]
     tb, te = spans["torch"]

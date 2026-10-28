@@ -27,23 +27,19 @@ constexpr int TJID = TOOL_JID;
 __device__ T d_eps;
 
 __global__ void analytic_kernel(const T *q0, const T *fc, const T *d_rc, const grid::robotModel<T> *m,
-                                T *d_fext, T *d_dfc, T *d_dq) {
-    __shared__ T s_fext[NR], s_dfc[NR*NFC], s_dq[NR*NV];
-    __shared__ T s_dtau[NV*6*NB], s_dqdd[NV*6*NB];
+                                T *d_fext, T *d_dfc, T *d_dq, T *workspace) {
+    // Large outputs/intermediates belong to caller-owned device workspace so
+    // the analytic routines retain their shared scratch on 64-KiB GPUs.
+    T *s_dtau = workspace, *s_dqdd = workspace + NV * NR;
     __shared__ T s_rc[3];
     if (threadIdx.x < 3 && threadIdx.y == 0) s_rc[threadIdx.x] = d_rc[threadIdx.x];
     // -J^T (its columns ARE the local body Jacobian -> the omega the dq map needs)
     grid::f_ext_gradient_device<T>(s_dtau, s_dqdd, q0, m);
     __syncthreads();
-    grid::f_ext_body_runtime_device<T>(s_fext, fc, TJID, s_rc, q0, m);
-    grid::f_ext_body_jacobian_dfc_runtime_device<T>(s_dfc, TJID, s_rc, q0, m);
-    grid::f_ext_body_jacobian_dq_runtime_device<T>(s_dq, fc, TJID, s_rc, s_dtau, q0, m);
+    grid::f_ext_body_runtime_device<T>(d_fext, fc, TJID, s_rc, q0, m);
+    grid::f_ext_body_jacobian_dfc_runtime_device<T>(d_dfc, TJID, s_rc, q0, m);
+    grid::f_ext_body_jacobian_dq_runtime_device<T>(d_dq, fc, TJID, s_rc, s_dtau, q0, m);
     __syncthreads();
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        for (int i = 0; i < NR; ++i)      d_fext[i] = s_fext[i];
-        for (int i = 0; i < NR*NFC; ++i)  d_dfc[i]  = s_dfc[i];
-        for (int i = 0; i < NR*NV; ++i)   d_dq[i]   = s_dq[i];
-    }
 }
 
 // f_ext value at a perturbed state. mode: 0 = perturb f_c[idx], 1 = SE(3)-retract q along dv[idx].
@@ -77,8 +73,8 @@ int main(){
     size_t s2 = grid::END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>();
     if (s2 > smem) smem = s2;
     smem += 4096;
-    cudaFuncSetAttribute(analytic_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    cudaFuncSetAttribute(fd_kernel,       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    CK(cudaFuncSetAttribute(analytic_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    CK(cudaFuncSetAttribute(fd_kernel,       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
 
     std::vector<T> hq(NQ, 0.0);
     hq[0]=0.05; hq[1]=-0.03; hq[2]=0.31;
@@ -93,14 +89,16 @@ int main(){
     T eps = 1e-6;
     CK(cudaMemcpyToSymbol(d_eps, &eps, sizeof(T)));
 
-    T *d_q,*d_fc,*d_rc,*d_fext,*d_dfc,*d_dq,*d_tmp;
+    T *d_q,*d_fc,*d_rc,*d_fext,*d_dfc,*d_dq,*d_tmp,*workspace;
     CK(cudaMalloc(&d_q, NQ*sizeof(T)));   CK(cudaMemcpy(d_q,hq.data(),NQ*sizeof(T),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_fc, NFC*sizeof(T))); CK(cudaMemcpy(d_fc,hfc.data(),NFC*sizeof(T),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_rc, 3*sizeof(T)));   CK(cudaMemcpy(d_rc,hrc,3*sizeof(T),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_fext, NR*sizeof(T))); CK(cudaMalloc(&d_dfc, (size_t)NR*NFC*sizeof(T)));
     CK(cudaMalloc(&d_dq, (size_t)NR*NV*sizeof(T))); CK(cudaMalloc(&d_tmp, NR*sizeof(T)));
+    CK(cudaMalloc(&workspace, (size_t)2*NV*NR*sizeof(T)));
 
-    analytic_kernel<<<1,128,smem>>>(d_q,d_fc,d_rc,m,d_fext,d_dfc,d_dq); CK(cudaDeviceSynchronize());
+    analytic_kernel<<<1,128,smem>>>(d_q,d_fc,d_rc,m,d_fext,d_dfc,d_dq,workspace);
+    CK(cudaPeekAtLastError()); CK(cudaDeviceSynchronize());
     std::vector<T> fext(NR), dfc((size_t)NR*NFC), dq((size_t)NR*NV);
     CK(cudaMemcpy(fext.data(), d_fext, NR*sizeof(T), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dfc.data(),  d_dfc,  (size_t)NR*NFC*sizeof(T), cudaMemcpyDeviceToHost));
@@ -141,7 +139,8 @@ int main(){
     std::vector<T> fc2(NFC); for (int i=0;i<NFC;++i) fc2[i] = 2.0*hfc[i];
     T *d_fc2; CK(cudaMalloc(&d_fc2, NFC*sizeof(T)));
     CK(cudaMemcpy(d_fc2, fc2.data(), NFC*sizeof(T), cudaMemcpyHostToDevice));
-    analytic_kernel<<<1,128,smem>>>(d_q,d_fc2,d_rc,m,d_fext,d_dfc,d_dq); CK(cudaDeviceSynchronize());
+    analytic_kernel<<<1,128,smem>>>(d_q,d_fc2,d_rc,m,d_fext,d_dfc,d_dq,workspace);
+    CK(cudaPeekAtLastError()); CK(cudaDeviceSynchronize());
     std::vector<T> fext2(NR), dfc2((size_t)NR*NFC);
     CK(cudaMemcpy(fext2.data(), d_fext, NR*sizeof(T), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dfc2.data(),  d_dfc,  (size_t)NR*NFC*sizeof(T), cudaMemcpyDeviceToHost));

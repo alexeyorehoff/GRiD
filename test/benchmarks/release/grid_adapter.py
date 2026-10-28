@@ -1,7 +1,7 @@
 """Real NumPy, JAX, PyTorch, native C-ABI and CUDA host-call paths sharing one build contract."""
 from __future__ import annotations
 import ctypes
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -177,12 +177,14 @@ class GridAdapter:
 
     # ── native C ABI (host-to-host through the wrapper's extern "C" surface) ──
     def native_library(self):
+        from .native_build import compiler_identity, shared_command
         source = Path(__file__).with_name("native_bridge.cpp")
-        compiler = subprocess.check_output(["g++", "--version"], text=True)
-        key = hashlib.sha256((digest(source) + compiler + "-std=c++17 -O2 -shared -fPIC -ldl").encode()).hexdigest()[:20]
+        compiler = compiler_identity()
+        build_source = Path(__file__).with_name("native_build.py")
+        key = hashlib.sha256((digest(source) + digest(build_source) + compiler).encode()).hexdigest()[:20]
         cache = ROOT / "test/benchmarks/results/release-build-cache"
-        lib = build_locked(cache / ("native-" + key + ".so"), lambda out: [
-            "g++", "-std=c++17", "-O2", "-shared", "-fPIC", str(source), "-ldl", "-o", str(out)])
+        lib = build_locked(cache / ("native-" + key + ".so"), lambda out:
+                           shared_command(source, out, exports=("grid_release_time",)))
         self.metadata["native_bridge_sha256"] = digest(lib)
         return ctypes.CDLL(str(lib))
 

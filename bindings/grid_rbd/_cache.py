@@ -56,13 +56,14 @@ from __future__ import annotations
 
 from grid_codegen.env_knobs import GENERATION_ENV_KNOBS as _ALL_GENERATION_ENV_KNOBS, BINDINGS_ENV_KNOBS
 
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +79,7 @@ _SCHEMA_VERSION = 1
 # pointer recorded under an older schema becomes unreachable (a miss), the
 # content-keyed store is untouched, and identical builds are still reused
 # through the content key. Migration = selective rebuild, never a global wipe.
-_KEY_SCHEMA = 2
+_KEY_SCHEMA = 3  # native Windows: PE DLLs and ELF shared objects are distinct artifacts
 _log = logging.getLogger("grid_rbd")
 
 
@@ -95,9 +96,12 @@ def detect_cuda_arch() -> int:
 
     Returns 0 if no GPU is detectable; callers should error out then.
     """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        return 0
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            [nvidia_smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
             text=True, stderr=subprocess.DEVNULL,
         ).strip().split("\n")[0].strip()
         major, minor = out.split(".")
@@ -359,19 +363,22 @@ BUILD_INPUTS_FILE = "build_inputs.json"
 
 
 def _host_cxx_tag() -> str:
-    """Host compiler nvcc drives (-ccbin default = c++ on PATH): path + the
-    first line of --version. Cached per process."""
+    """Host compiler nvcc drives: resolved path + version banner.
+    Cached per process until the toolchain snapshot changes."""
     global _HOST_CXX_TAG
     _toolchain_memo_valid()
     if _HOST_CXX_TAG is None:
-        cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+        cxx = (shutil.which("cl") if os.name == "nt" else
+               shutil.which("c++") or shutil.which("g++") or shutil.which("clang++"))
         if cxx is None:
             _HOST_CXX_TAG = "missing"
         else:
             try:
-                out = subprocess.run([cxx, "--version"], capture_output=True,
+                out = subprocess.run([cxx] if os.name == "nt" else [cxx, "--version"], capture_output=True,
                                      text=True, timeout=30)
-                first = (out.stdout.strip().splitlines() or [f"rc={out.returncode}"])[0]
+                # cl puts its version on stderr and generic usage on stdout.
+                banner = out.stderr + out.stdout if os.name == "nt" else out.stdout + out.stderr
+                first = (banner.strip().splitlines() or [f"rc={out.returncode}"])[0]
                 _HOST_CXX_TAG = f"{cxx}:{first}"
             except Exception:
                 _HOST_CXX_TAG = f"{cxx}:error"
@@ -459,7 +466,7 @@ def _toolchain_snapshot():
     """Resolved compiler paths + their (mtime_ns, size): a PATH change or a
     replaced binary behind the same path re-measures nvcc/host-cxx versions."""
     out = []
-    for name in ("nvcc", "c++", "g++", "clang++"):
+    for name in (("nvcc", "cl") if os.name == "nt" else ("nvcc", "c++", "g++", "clang++")):
         exe = shutil.which(name)
         try:
             st = os.stat(exe) if exe else None
@@ -488,8 +495,11 @@ def build_identity(cuda_arch: int) -> dict[str, Any]:
     """Every artifact-shaping input that is NOT a caller option, as a readable
     dict (persisted beside each store entry as build_inputs.json). Folded into
     the stage-1 key; its toolchain subset is folded into the content key."""
+    from grid_codegen.windows import ensure_msvc_environment
+    ensure_msvc_environment(required=False)
     identity: dict[str, Any] = {
         "key_schema": _KEY_SCHEMA,
+        "platform": sys.platform,
         "cuda_arch": int(cuda_arch),
         "nvcc": _nvcc_identity(),
         "host_cxx": _host_cxx_tag(),
@@ -519,13 +529,13 @@ def build_identity(cuda_arch: int) -> dict[str, Any]:
 # include everything (older key schema).
 def write_build_inputs(entry_dir: Path, identity: dict[str, Any]) -> None:
     tmp = entry_dir / f".{BUILD_INPUTS_FILE}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(identity, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(identity, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(entry_dir / BUILD_INPUTS_FILE)
 
 
 def read_build_inputs(entry_dir: Path) -> dict[str, Any] | None:
     try:
-        return json.loads((entry_dir / BUILD_INPUTS_FILE).read_text())
+        return json.loads((entry_dir / BUILD_INPUTS_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
@@ -554,7 +564,7 @@ def stale_hit_reasons(entry_dir: Path, identity: dict[str, Any]) -> list[str]:
 # What decides whether dlopen + the C ABI + the framework op tables are sound:
 # the wrapper the .so was generated from, the torch/jax ABIs its tables were
 # compiled against, the GPU it was compiled for, and the key schema.
-LOAD_IDENTITY_KEYS = ("key_schema", "cuda_arch", "wrapper_template", "torch_abi", "jax_ffi")
+LOAD_IDENTITY_KEYS = ("key_schema", "platform", "cuda_arch", "wrapper_template", "torch_abi", "jax_ffi")
 
 
 def load_incompat_reasons(entry_dir: Path, identity: dict[str, Any]) -> list[str]:
@@ -583,6 +593,19 @@ def _arch_loadable(recorded: dict[str, Any], current_arch: Any) -> bool:
         return True
     archs = recorded.get("cuda_archs")
     return isinstance(archs, list) and current_arch in archs
+
+
+def stamp_forced_rebuild(source_dir: Path) -> None:
+    """Give a forced Windows build its own loadable DLL image.
+
+    Windows cannot replace a mapped DLL. A source stamp keeps the store
+    content-addressed while giving the rebuilt library and its framework op
+    namespace a fresh identity. Ordinary loads reuse the updated input-key map.
+    """
+    if os.name == "nt":
+        import uuid
+        with (source_dir / "grid.cuh").open("a", encoding="utf-8", newline="\n") as header:
+            header.write(f"\n// Forced Windows DLL image: {uuid.uuid4().hex}\n")
 
 
 def compute_content_key(source_dir: Path, options: dict[str, Any],
@@ -616,6 +639,7 @@ def compute_content_key(source_dir: Path, options: dict[str, Any],
     # submodule must never share a key with the clean commit it sits on.
     h.update(f"glass={_glass_content_hash()}".encode())
     h.update(f"key_schema={_KEY_SCHEMA}".encode())
+    h.update(f"platform={sys.platform}".encode())
     return h.hexdigest()
 
 
@@ -623,7 +647,7 @@ def keymap_lookup(cache_dir: Path, input_key: str) -> str | None:
     """input-key -> content-key pointer, or None if unrecorded."""
     path = cache_dir / "bykey" / input_key
     try:
-        return path.read_text().strip() or None
+        return path.read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
 
@@ -632,7 +656,7 @@ def keymap_record(cache_dir: Path, input_key: str, content_key: str) -> None:
     bykey = cache_dir / "bykey"
     bykey.mkdir(parents=True, exist_ok=True)
     tmp = bykey / f".{input_key}.{os.getpid()}.tmp"
-    tmp.write_text(content_key + "\n")
+    tmp.write_text(content_key + "\n", encoding="utf-8")
     tmp.replace(bykey / input_key)  # atomic; last-writer-wins with same value
 
 
@@ -642,7 +666,7 @@ def load_manifest(cache_dir: Path) -> dict[str, Any]:
     path = manifest_path(cache_dir)
     if not path.exists():
         return {"schema_version": _SCHEMA_VERSION, "robots": {}}
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         data = json.load(f)
     if data.get("schema_version") != _SCHEMA_VERSION:
         # Future: handle migrations. For now, refuse to use older manifests.
@@ -661,7 +685,7 @@ def save_manifest(cache_dir: Path, manifest: dict[str, Any]) -> None:
     # pool warms robots concurrently) must never interleave in one tmp file —
     # each rename then publishes a complete manifest (last-writer-wins).
     tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     tmp.replace(path)  # atomic on POSIX
 
@@ -682,7 +706,7 @@ def manifest_register(
     the second rename dropped the first's robot. save_manifest's tmp+rename
     still makes each publish atomic for readers, which take no lock."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with (cache_dir / "manifest.lock").open("a+") as lock:
+    with (cache_dir / "manifest.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             manifest = load_manifest(cache_dir)
@@ -710,6 +734,41 @@ def list_registered(cache_dir: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the process on Windows. Query a handle
+        # instead; cache cleanup must never kill another live compiler.
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:  # ERROR_INVALID_PARAMETER: no such PID
+                return False
+            if error == 5:  # ERROR_ACCESS_DENIED: a protected live process
+                return True
+            raise ctypes.WinError(error)
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def _sweep_dead_staging_dirs(store: Path) -> int:
     """Remove `.gen_<pid>_<key>` staging dirs whose owning process is gone.
     The builder deletes its own staging dir in a `finally`, but a killed
@@ -729,13 +788,8 @@ def _sweep_dead_staging_dirs(store: Path) -> int:
             continue
         if pid == os.getpid():
             continue
-        try:
-            os.kill(pid, 0)
+        if _pid_is_alive(pid):
             continue  # alive: a concurrent builder owns it
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            continue  # alive, other user
         _shutil.rmtree(d, ignore_errors=True)
         removed += 1
     return removed

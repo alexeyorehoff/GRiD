@@ -92,56 +92,67 @@ __global__ void centroidal_bias_kernel(const T *g_q, const T *g_qd,
 }
 
 // com_device: s_out = [p_com (3); J_com (3 x NV col-major)] = 3 + 3*NV.
-template <typename T>
-__global__ void com_kernel(const T *g_q, const grid::robotModel<T> *d_robotModel, T *o_com) {
+template <typename T, bool J_IN_SMEM>
+__global__ void com_kernel(const T *g_q, const grid::robotModel<T> *d_robotModel, T *o_com, T *workspace) {
     __shared__ T s_q[NQ];
-    __shared__ T s_out[3 + 3 * NV];
     const int tid = threadIdx.x + threadIdx.y * blockDim.x;
     const int nth = blockDim.x * blockDim.y;
     for (int i = tid; i < NQ; i += nth) s_q[i] = g_q[i];
     __syncthreads();
-    grid::com_device<T>(s_out, s_q, d_robotModel);
-    __syncthreads();
-    for (int i = tid; i < 3 + 3 * NV; i += nth) o_com[i] = s_out[i];
+    // The device function only writes its output; use the caller's global
+    // destination directly, leaving shared memory for inputs and scratch.
+    grid::com_device<T, J_IN_SMEM>(o_com, s_q, d_robotModel, workspace);
     __syncthreads();
 }
 
 // ccrba_device: s_out = [A (6 x NV col-major); h (6)] = 6*NV + 6.
-template <typename T>
+template <typename T, bool J_IN_SMEM>
 __global__ void ccrba_kernel(const T *g_q, const T *g_qd,
-                             const grid::robotModel<T> *d_robotModel, T *o_ccrba) {
+                             const grid::robotModel<T> *d_robotModel, T *o_ccrba, T *workspace) {
     __shared__ T s_q[NQ], s_qd[NV];
-    __shared__ T s_out[6 * NV + 6];
     const int tid = threadIdx.x + threadIdx.y * blockDim.x;
     const int nth = blockDim.x * blockDim.y;
     for (int i = tid; i < NQ; i += nth) s_q[i] = g_q[i];
     for (int i = tid; i < NV; i += nth) s_qd[i] = g_qd[i];
     __syncthreads();
-    grid::ccrba_device<T>(s_out, s_q, s_qd, d_robotModel);
-    __syncthreads();
-    for (int i = tid; i < 6 * NV + 6; i += nth) o_ccrba[i] = s_out[i];
+    grid::ccrba_device<T, J_IN_SMEM>(o_ccrba, s_q, s_qd, d_robotModel, workspace);
     __syncthreads();
 }
 
 // energy_device: s_out = [KE, PE, mechanical] = 3.
-template <typename T>
+template <typename T, bool J_IN_SMEM>
 __global__ void energy_kernel(const T *g_q, const T *g_qd,
-                              const grid::robotModel<T> *d_robotModel, T gravity, T *o_energy) {
+                              const grid::robotModel<T> *d_robotModel, T gravity, T *o_energy, T *workspace) {
     __shared__ T s_q[NQ], s_qd[NV];
-    __shared__ T s_out[3];
     const int tid = threadIdx.x + threadIdx.y * blockDim.x;
     const int nth = blockDim.x * blockDim.y;
     for (int i = tid; i < NQ; i += nth) s_q[i] = g_q[i];
     for (int i = tid; i < NV; i += nth) s_qd[i] = g_qd[i];
     __syncthreads();
-    grid::energy_device<T>(s_out, s_q, s_qd, d_robotModel, gravity);
-    __syncthreads();
-    for (int i = tid; i < 3; i += nth) o_energy[i] = s_out[i];
+    grid::energy_device<T, J_IN_SMEM>(o_energy, s_q, s_qd, d_robotModel, gravity, workspace);
     __syncthreads();
 }
 
 template <typename T>
 T *dmalloc(int count) { T *p; cudaMalloc(&p, count * sizeof(T)); return p; }
+
+template <typename T, bool J_IN_SMEM>
+void launch_centroidal(const T *q, const T *qd, const grid::robotModel<T> *model,
+                       T gravity, int threads, T *com, T *ccrba, T *energy) {
+    const size_t bytes = grid::CENTROIDAL_DEVICE_SHARED_MEM_BYTES<T, J_IN_SMEM>();
+    T *workspace = nullptr;
+    if constexpr (!J_IN_SMEM) workspace = dmalloc<T>(6 * NV * grid::NUM_BODIES);
+    gpuErrchk(cudaFuncSetAttribute(com_kernel<T, J_IN_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+    com_kernel<T, J_IN_SMEM><<<1, threads, bytes>>>(q, model, com, workspace);
+    gpuErrchkKernel();
+    gpuErrchk(cudaFuncSetAttribute(ccrba_kernel<T, J_IN_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+    ccrba_kernel<T, J_IN_SMEM><<<1, threads, bytes>>>(q, qd, model, ccrba, workspace);
+    gpuErrchkKernel();
+    gpuErrchk(cudaFuncSetAttribute(energy_kernel<T, J_IN_SMEM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+    energy_kernel<T, J_IN_SMEM><<<1, threads, bytes>>>(q, qd, model, gravity, energy, workspace);
+    gpuErrchkKernel();
+    if (workspace) gpuErrchk(cudaFree(workspace));
+}
 template <typename T>
 void dcopy_out(const std::string &name, T *dptr, int rows, int cols) {
     std::vector<T> h(rows * cols);
@@ -201,20 +212,15 @@ void run() {
     T *o_ccrba = dmalloc<T>(6 * NV + 6);
     T *o_energy = dmalloc<T>(3);
 
-    size_t dyn_com = grid::COM_DYNAMIC_SHARED_MEM_BYTES<T>();
-    cudaFuncSetAttribute(com_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_com);
-    com_kernel<T><<<1, nthreads, dyn_com>>>(g_q, d_robotModel, o_com);
-    gpuErrchkKernel();
-
-    size_t dyn_ccrba = grid::CCRBA_DYNAMIC_SHARED_MEM_BYTES<T>();
-    cudaFuncSetAttribute(ccrba_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_ccrba);
-    ccrba_kernel<T><<<1, nthreads, dyn_ccrba>>>(g_q, g_qd, d_robotModel, o_ccrba);
-    gpuErrchkKernel();
-
-    size_t dyn_energy = grid::ENERGY_DYNAMIC_SHARED_MEM_BYTES<T>();
-    cudaFuncSetAttribute(energy_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn_energy);
-    energy_kernel<T><<<1, nthreads, dyn_energy>>>(g_q, g_qd, d_robotModel, gravity, o_energy);
-    gpuErrchkKernel();
+    int device = 0, cap = 0;
+    gpuErrchk(cudaGetDevice(&device));
+    gpuErrchk(cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    cudaFuncAttributes attrs;
+    gpuErrchk(cudaFuncGetAttributes(&attrs, ccrba_kernel<T, true>));
+    if (grid::CENTROIDAL_DEVICE_SHARED_MEM_BYTES<T>() + attrs.sharedSizeBytes <= (size_t)cap)
+        launch_centroidal<T, true>(g_q, g_qd, d_robotModel, gravity, nthreads, o_com, o_ccrba, o_energy);
+    else
+        launch_centroidal<T, false>(g_q, g_qd, d_robotModel, gravity, nthreads, o_com, o_ccrba, o_energy);
 
     // p_com (first 3) + J_com (next 3*NV, col-major 3 x NV)
     {

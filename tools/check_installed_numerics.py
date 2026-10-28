@@ -7,6 +7,7 @@ waived. Uses FP64 bundled RBDReference and existing float32 error bounds.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 import numpy as np
 import grid_rbd
@@ -17,7 +18,21 @@ from RBDReference import RBDReference
 
 
 def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
-        *, require_installed=True, cache_dir=None):
+        *, require_installed=True, cache_dir=None, backends=None):
+    # JAX's NVIDIA backend is not supported on native Windows. Keep every
+    # numerical and autograd check for the native frameworks available there;
+    # explicit requests (including JAX) still require the requested backend.
+    if backends is None:
+        backends = ('numpy', 'torch') if sys.platform == 'win32' else ('numpy', 'jax', 'torch')
+    backends = tuple(backends)
+    if 'numpy' not in backends or set(backends) - {'numpy', 'jax', 'torch'}:
+        raise ValueError('backends must include numpy and may also include jax and torch')
+    print('Native backend coverage:', ', '.join(backends), flush=True)
+    if 'jax' in backends:
+        import jax
+        import jax.numpy as jnp
+    if 'torch' in backends:
+        import torch
     WORK = Path(work).resolve()
     WORK.mkdir(parents=True,exist_ok=True)
     urdf_dir = Path(urdf_dir).resolve()
@@ -86,11 +101,13 @@ def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
         compare(f'{name}/external-forces-ID',force_actual,force_expected)
         compare(f'{name}/noncontiguous-cast-FD',h.forward_dynamics(np.asfortranarray(q),v.astype(float),u),h.forward_dynamics(q,v,u),tol=1e-6)
         # Native differentiable backends on real URDFs, same build/cache.
-        import jax
-        import jax.numpy as jnp
-        import torch
-        jh = grid_rbd.register_robot(name, backend='jax', **options)
-        th = grid_rbd.register_robot(name, backend='torch', **options)
+        handles = [('numpy', h, lambda x: x)]
+        if 'jax' in backends:
+            jh = grid_rbd.register_robot(name, backend='jax', **options)
+            handles.append(('jax', jh, jnp.asarray))
+        if 'torch' in backends:
+            th = grid_rbd.register_robot(name, backend='torch', **options)
+            handles.append(('torch', th, lambda x: torch.tensor(x, device='cuda')))
         # Every operand must vary independently across samples. Identical force
         # rows mask a missing batch offset even with arbitrary q/qd/u.
         for pattern, forces in [('distinct', fe), ('repeated', np.repeat(fe[:1], len(fe), axis=0)), ('zero', np.zeros_like(fe))]:
@@ -105,9 +122,7 @@ def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
                         if op == 'forward_dynamics_gradient': row = np.hstack(row)
                         expected.append(row)
                     expected = np.stack(expected)
-                    for backend, handle in [('numpy',h), ('jax',jh), ('torch',th)]:
-                        convert = {'numpy': lambda x:x, 'jax': jnp.asarray,
-                                   'torch': lambda x:torch.tensor(x,device='cuda')}[backend]
+                    for backend, handle, convert in handles:
                         def call(order):
                             values = getattr(handle,op)(convert(q[order]),convert(v[order]),
                                 None if bias else convert(third[order]),f_ext=convert(forces[order]))
@@ -120,18 +135,24 @@ def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
                             compare(label+'/single-calls',singles,expected)
         for op,third in [('inverse_dynamics',a), ('forward_dynamics',u)]:
             expected = getattr(h,op)(q,v,third)
-            jf = jax.jit(lambda x,y,z: getattr(jh,op)(x,y,z))
-            compare(f'{name}/{op}/jax-jit', np.asarray(jf(jnp.asarray(q),jnp.asarray(v),jnp.asarray(third))), expected)
-            tt = [torch.tensor(x,device='cuda',requires_grad=True) for x in (q,v,third)]
-            tv = getattr(th,op)(*tt)
-            compare(f'{name}/{op}/torch', tv.detach().cpu().numpy(), expected)
-            tv.sum().backward()
-            jg = jax.jit(jax.grad(lambda x,y,z: getattr(jh,op)(x,y,z).sum(), argnums=(0,1,2)))(jnp.asarray(q),jnp.asarray(v),jnp.asarray(third))
-            differentiated = range(2 if op=='inverse_dynamics' else 3)
-            if op=='inverse_dynamics':
-                assert tt[2].grad is None  # documented: qdd is held constant
-            for k in differentiated:
-                compare(f'{name}/{op}/autograd-input{k}', np.asarray(jg[k]), tt[k].grad.cpu().numpy())
+            differentiated = tuple(range(2 if op=='inverse_dynamics' else 3))
+            gradients = {}
+            if 'jax' in backends:
+                jf = jax.jit(lambda x,y,z: getattr(jh,op)(x,y,z))
+                compare(f'{name}/{op}/jax-jit', np.asarray(jf(jnp.asarray(q),jnp.asarray(v),jnp.asarray(third))), expected)
+                jg = jax.jit(jax.grad(lambda x,y,z: getattr(jh,op)(x,y,z).sum(), argnums=(0,1,2)))(jnp.asarray(q),jnp.asarray(v),jnp.asarray(third))
+                gradients['jax'] = tuple(np.asarray(jg[k]) for k in differentiated)
+            if 'torch' in backends:
+                tt = [torch.tensor(x,device='cuda',requires_grad=True) for x in (q,v,third)]
+                tv = getattr(th,op)(*tt)
+                compare(f'{name}/{op}/torch', tv.detach().cpu().numpy(), expected)
+                tv.sum().backward()
+                if op=='inverse_dynamics':
+                    assert tt[2].grad is None  # documented: qdd is held constant
+                gradients['torch'] = tuple(tt[k].grad.cpu().numpy() for k in differentiated)
+            if 'jax' in gradients and 'torch' in gradients:
+                for k in differentiated:
+                    compare(f'{name}/{op}/autograd-input{k}', gradients['jax'][k], gradients['torch'][k])
             # Independent central differences of the FP64 bundled oracle, including
             # quaternion coordinates for floating q (normalizing extension).
             def objective(x,y,z):
@@ -144,17 +165,23 @@ def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
                     plus=[x.copy() for x in base]; minus=[x.copy() for x in base]
                     plus[k][col]+=eps; minus[k][col]-=eps
                     fd[col]=(objective(*plus)-objective(*minus))/(2*eps)
-                compare(f'{name}/{op}/autograd-oracle-input{k}', np.asarray(jg[k])[0], fd)
+                for backend, gradient in gradients.items():
+                    compare(f'{name}/{op}/autograd-oracle/{backend}/input{k}', gradient[k][0], fd)
         # Backward paths must retain the matching force row too. Compare BOTH
         # samples independently, not merely the summed gradient or backend parity.
         for op, third in [('inverse_dynamics', a), ('forward_dynamics', u)]:
             differentiated = tuple(range(2 if op == 'inverse_dynamics' else 3))
-            jf = jax.jit(jax.grad(
-                lambda x, y, z: getattr(jh, op)(x, y, z, f_ext=jnp.asarray(fe)).sum(),
-                argnums=differentiated))
-            jg = jf(jnp.asarray(q), jnp.asarray(v), jnp.asarray(third))
-            tensors = [torch.tensor(x, device='cuda', requires_grad=True) for x in (q, v, third)]
-            getattr(th, op)(*tensors, f_ext=torch.tensor(fe, device='cuda')).sum().backward()
+            gradients = {}
+            if 'jax' in backends:
+                jf = jax.jit(jax.grad(
+                    lambda x, y, z: getattr(jh, op)(x, y, z, f_ext=jnp.asarray(fe)).sum(),
+                    argnums=differentiated))
+                jg = jf(jnp.asarray(q), jnp.asarray(v), jnp.asarray(third))
+                gradients['jax'] = tuple(np.asarray(g) for g in jg)
+            if 'torch' in backends:
+                tensors = [torch.tensor(x, device='cuda', requires_grad=True) for x in (q, v, third)]
+                getattr(th, op)(*tensors, f_ext=torch.tensor(fe, device='cuda')).sum().backward()
+                gradients['torch'] = tuple(tensors[k].grad.cpu().numpy() for k in differentiated)
             for sample in range(len(q)):
                 base = [q[sample].astype(float), v[sample].astype(float), third[sample].astype(float)]
                 def force_objective(args):
@@ -167,10 +194,9 @@ def run(work, urdf_dir, robot_cases=(('iiwa14',False),('go2',True)),
                         plus[k][col] += 1e-5
                         minus[k][col] -= 1e-5
                         numeric[col] = (force_objective(plus) - force_objective(minus)) / 2e-5
-                    for backend, gradient in [('jax', np.asarray(jg[k])),
-                                              ('torch', tensors[k].grad.cpu().numpy())]:
+                    for backend, values in gradients.items():
                         compare(f'{name}/{op}/force-autograd/{backend}/row{sample}/input{k}',
-                                gradient[sample], numeric)
+                                values[k][sample], numeric)
         if not floating:
             for op in ('idsva_so','fdsva_so'):
                 arg = a if op=='idsva_so' else u
@@ -215,5 +241,7 @@ if __name__ == '__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work',type=Path,required=True)
     parser.add_argument('--urdf-dir',type=Path,required=True)
+    parser.add_argument('--backends', nargs='+', choices=('numpy', 'jax', 'torch'),
+                        help='Native backends to check (default: numpy/torch on Windows, all elsewhere)')
     args=parser.parse_args()
-    run(args.work,args.urdf_dir)
+    run(args.work,args.urdf_dir,backends=args.backends)

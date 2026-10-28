@@ -1,5 +1,6 @@
 """Acceptance matrix for the launcher; all driver/verifier calls are simulated."""
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -73,7 +74,8 @@ def test_dry_launcher_has_no_output_or_lock_side_effects(launch):
     assert not launcher.LOCK_PATH.exists()
 
 
-def test_real_sigterm_forwards_to_owned_driver_and_waits(tmp_path):
+@pytest.mark.parametrize('adoption_delay', [0.0, 0.3] if os.name == 'nt' else [0.0])
+def test_real_sigterm_forwards_to_owned_driver_and_waits(tmp_path, adoption_delay):
     """Real CPU subprocesses, no receipt or GPU; parent SIGTERM leaves no child."""
     import os
     import signal
@@ -81,9 +83,23 @@ def test_real_sigterm_forwards_to_owned_driver_and_waits(tmp_path):
     import sys
     import time
     marker = tmp_path / 'child.pid'
-    child = f'import os,time; open({str(marker)!r}, "w").write(str(os.getpid())); time.sleep(60)'
+    owner_marker = tmp_path / 'owner.pid'
+    ready = tmp_path / 'owned'
+    child = ('import os,time; '
+             f'assert os.name != "nt" or os.path.exists({str(ready)!r}), "child ran before adoption"; '
+             f'open({str(marker) + ".tmp"!r}, "w").write(str(os.getpid())); '
+             f'os.replace({str(marker) + ".tmp"!r}, {str(marker)!r}); time.sleep(60)')
     script = ('from test.run_validation import run_driver\n'
-              f'import sys\nwith open({str(tmp_path / "lock")!r}, "a") as lock, '
+              'from test import processes\nimport time\n'
+              '_own = processes.own_process_tree\n'
+              'def adopt(process):\n'
+              f' time.sleep({adoption_delay!r})\n'
+              ' result = _own(process)\n'
+              f' open({str(ready)!r}, "w").write("ready")\n'
+              ' return result\n'
+              'processes.own_process_tree = adopt\n'
+              f'import sys,os\nopen({str(owner_marker)!r}, "w").write(str(os.getpid()))\n'
+              f'with open({str(tmp_path / "lock")!r}, "a") as lock, '
               f'open({str(tmp_path / "log")!r}, "w") as log:\n'
               f' run_driver([sys.executable,"-c",{child!r}],log=log,lock=lock)\n')
     parent = subprocess.Popen([sys.executable, '-c', script], cwd=launcher.ROOT,
@@ -94,10 +110,15 @@ def test_real_sigterm_forwards_to_owned_driver_and_waits(tmp_path):
             time.sleep(.02)
         assert marker.exists(), 'child did not start'
         pid = int(marker.read_text())
-        parent.send_signal(signal.SIGTERM)
+        # On Windows a venv launcher wraps the real Python process; terminate
+        # the launcher logic's owner, whose job must reap the driver tree.
+        os.kill(int(owner_marker.read_text()), signal.SIGTERM)
         assert parent.wait(timeout=10) != 0
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+        from grid_rbd._cache import _pid_is_alive
+        deadline = time.monotonic() + 5
+        while _pid_is_alive(pid) and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not _pid_is_alive(pid)
     finally:
         if parent.poll() is None:
             parent.kill(); parent.wait()

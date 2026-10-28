@@ -54,7 +54,7 @@ def iiwa14_gen(request, tmp_path_factory):
 
 def test_fragments_cover_file_and_strip_sentinels(iiwa14_gen):
     gen, out, _ = iiwa14_gen
-    text = out.read_text()
+    text = out.read_text(encoding="utf-8")
     assert FRAGMENT_SENTINEL not in text, "sentinel leaked into the written header"
     assert text == gen.code_str
     # stripping is idempotent: re-splitting a stripped stream is one fragment

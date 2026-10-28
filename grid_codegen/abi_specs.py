@@ -460,9 +460,7 @@ ABI_SPECS: dict[str, AbiSpec] = {
         pack_mode="q_qd_u",
         takes_gravity=True,
         takes_dt_it=True, it_dispatch="FULL",   # GRID_RBD_IT_DISPATCH cases 0-5
-                                  # (no TIER, no SIG_MJX fork — UNLIKE the integrator's
-                                  # launcher, which passes TIER and forks on
-                                  # GRID_RBD_SIG_MJX_INTEGRATOR)
+        sig_mjx_macro="GRID_RBD_SIG_MJX_INTEGRATOR_GRADIENT",
         pre_launch_check=True,    # { cudaGetLastError() -> return 200+e } after dispatch
         out_buffer="h_dAB", out_copy="memcpy_h",
         out_size_expr="(2 * grid::NUM_VEL) * (3 * grid::NUM_VEL)",

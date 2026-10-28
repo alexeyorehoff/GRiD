@@ -1,4 +1,6 @@
 # GRiD
+
+Native Windows + CUDA setup and test commands: [Windows guide](docs/windows.md).
 [![CI](https://img.shields.io/github/actions/workflow/status/A2R-Lab/GRiD/verify-gpu-proof.yml?branch=main&style=flat-square&label=CI)](https://github.com/A2R-Lab/GRiD/actions/workflows/verify-gpu-proof.yml)
 [![docs](https://img.shields.io/github/actions/workflow/status/A2R-Lab/GRiD/gh-pages.yml?branch=main&style=flat-square&label=docs)](https://a2r-lab.org/GRiD/)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](https://github.com/A2R-Lab/GRiD/blob/main/LICENSE)

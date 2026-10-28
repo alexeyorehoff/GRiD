@@ -210,7 +210,8 @@ def test_jax_no_f_ext_residue_after_f_ext_call(handle, samples):
     f_ext input while still passing d_f_ext to their kernels — without the
     stream-ordered reset in the value handlers, a prior f_ext call silently
     poisoned every later jax gradient (repro measured 21.2 max drift)."""
-    gj = pytest.importorskip("grid_rbd.jax")
+    pytest.importorskip("jax", reason="jax not installed")
+    import grid_rbd.jax as gj
     jh = gj.register_robot(name="iiwa14_fext_smoke", urdf_path=str(_URDF),
                            floating_base=False, max_batch_size=8)
     q = samples["q"]; qd = samples["qd"]

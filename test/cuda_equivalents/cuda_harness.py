@@ -1,5 +1,5 @@
 import contextlib
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import json
 import os
@@ -1800,6 +1800,37 @@ def _run_flagship_split_cell(spec, base_mode, cell, num_threads, tmp_path, reque
     )
 
 
+def _fp64_oracle_source(resolved, tmp_path):
+    """Give Pinocchio the same joint-origin geometry the parser code-generates.
+
+    URDFParser snaps near-quarter-turn joint angles (e.g. 1.5708) to pi/2.
+    A literal Pinocchio model differs by microradians, exceeding fp64 tolerances
+    even with exact dynamics. Preserve inertial origins, which the parser does
+    not snap. The reference calculation remains Pinocchio's independent C++.
+    """
+    from dataclasses import replace
+    from bs4 import BeautifulSoup
+    from RBDReference.equivalents.pinocchio_backend import _snap_rpy_value_to_pi_grid
+
+    source = Path(resolved.urdf_path)
+    soup = BeautifulSoup(source.read_text(encoding="utf-8"), "xml")
+    changed = False
+    for joint in soup.robot.find_all("joint", recursive=False):
+        origin = joint.find("origin", recursive=False)
+        if origin is None or not origin.has_attr("rpy"):
+            continue
+        values = [float(value) for value in origin["rpy"].split()]
+        snapped = [float(_snap_rpy_value_to_pi_grid(value)) for value in values]
+        if snapped != values:
+            origin["rpy"] = " ".join(repr(value) for value in snapped)
+            changed = True
+    if not changed:
+        return resolved
+    target = Path(tmp_path) / "fp64_oracle.urdf"
+    target.write_text(str(soup), encoding="utf-8")
+    return replace(resolved, urdf_path=str(target))
+
+
 def _run_cuda_equivalence_case(
     spec,
     base_mode,
@@ -1855,10 +1886,16 @@ def _run_cuda_equivalence_case(
     #    d2(pose)/dv2 to about 1e-10 fleet-wide.
     project_model = build_project_adapter(spec, resolved, base_mode=base_mode)
     oracle_backend = resolve_backend(os.environ.get("GRID_REFERENCE_BACKEND", "pinocchio"))
+    oracle_resolved = resolved
+    if dtype == "double" and oracle_backend == "pinocchio" and not _robot_has_mimic_joints(project_model):
+        # The existing mimic oracle already matches the parser's snapped
+        # geometry. Match non-mimic fp64 inputs too, keeping float validation
+        # and its established reference models unchanged.
+        oracle_resolved = _fp64_oracle_source(resolved, tmp_path)
     reference_model = (
         project_model
         if oracle_backend == "reference"
-        else build_adapter(spec, resolved, base_mode=base_mode, backend=oracle_backend)
+        else build_adapter(spec, oracle_resolved, base_mode=base_mode, backend=oracle_backend)
     )
     _progress(config, f"oracle backend={oracle_backend} for {spec.robot_id}-{base_mode}")
 

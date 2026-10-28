@@ -29,6 +29,27 @@ import pytest
 
 
 @pytest.fixture(autouse=True, scope="module")
+def _optional_jax_gpu_backend(request):
+    """Apply the optional GPU precondition only when a JAX handle is requested."""
+    try:
+        import jax
+    except ImportError:
+        yield
+        return
+    if jax.default_backend() == "gpu":
+        yield
+        return
+    if Path(request.module.__file__).name == "test_iiwa14_jax_smoke.py":
+        pytest.skip("JAX NVIDIA GPU backend unavailable (installed JAX is CPU-only)")
+    import grid_rbd.jax as backend
+    with pytest.MonkeyPatch.context() as patch:
+        def unavailable():
+            pytest.skip("JAX NVIDIA GPU backend unavailable (installed JAX is CPU-only)")
+        patch.setattr(backend, "_require_gpu_backend", unavailable)
+        yield
+
+
+@pytest.fixture(autouse=True, scope="module")
 def _close_module_handles():
     if os.environ.get("GRID_TEST_NO_CLOSE") == "1":
         yield

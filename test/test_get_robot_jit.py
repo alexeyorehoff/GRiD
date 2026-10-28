@@ -39,6 +39,7 @@ def test_miss_with_urdf_registers_then_hit_ignores_it(stubs, monkeypatch):
         return _warm(stubs, name=name)
     monkeypatch.setattr(grid_rbd, "register_robot", rec)
     monkeypatch.setattr(grid_rbd, "RobotHandle", _Handle)
+    monkeypatch.setattr(grid_rbd, "detect_cuda_arch", lambda: 120)
     h = grid_rbd.get_robot("jit", cache_dir=stubs.cache_dir, urdf_path="/robots/jit.urdf", floating_base=True)
     assert calls == [("jit", "/robots/jit.urdf", {"cache_dir": stubs.cache_dir, "floating_base": True})]
     assert h.name == "jit"

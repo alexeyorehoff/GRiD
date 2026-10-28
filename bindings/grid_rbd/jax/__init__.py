@@ -1607,6 +1607,7 @@ def register_robot(
     Returns a :py:class:`JaxRobotHandle`.
     """
     _require_jax()  # fail early with install guidance if jax is missing
+    _require_gpu_backend()  # refuse CPU-only JAX before generating or compiling
     if dtype == "float64":
         import jax as _jax
         if not _jax.config.jax_enable_x64:

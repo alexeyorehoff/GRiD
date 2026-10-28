@@ -51,12 +51,26 @@ _MAXRSS_RE = re.compile(r"Maximum resident set size \(kbytes\):\s*(\d+)")
 DEFAULT_PEAK_KB = 8 * 1024 * 1024      # 8 GB — unmeasured compile assumption (tree peak)
 DEFAULT_SECS = 600.0                   # unmeasured wall-time assumption (ordering only)
 LEDGER_SCHEMA = 2                      # 1 = flat {key: ru_maxrss_kb} (dropped: under-predicts)
-_PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+_PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024 if hasattr(os, "sysconf") else 4
 
 
 def session_tree_rss_kb(sid: int) -> int:
     """Summed RSS (kB) of every live process whose session id is `sid` (the
     worker runs under setsid, so its whole compiler tree shares it)."""
+    if os.name == "nt":
+        import psutil
+        try:
+            processes = [psutil.Process(sid)]
+            processes.extend(processes[0].children(recursive=True))
+        except psutil.NoSuchProcess:
+            return 0
+        total = 0
+        for process in processes:
+            try:
+                total += process.memory_info().rss // 1024
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total
     total = 0
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -77,6 +91,9 @@ DEFAULT_MAX_JOBS = 5
 
 
 def mem_available_kb() -> int:
+    if os.name == "nt":
+        import psutil
+        return psutil.virtual_memory().available // 1024
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("MemAvailable:"):
@@ -209,6 +226,30 @@ class RamScheduler:
         with self._state_lock:
             self._stop.set()
             procs = list(self._procs.values())
+        if os.name == "nt":
+            import psutil
+            owned = []
+            for process in procs:
+                try:
+                    parent = psutil.Process(process.pid)
+                    owned.extend(reversed(parent.children(recursive=True)))
+                    owned.append(parent)
+                except psutil.NoSuchProcess:
+                    pass
+            for process in owned:
+                try:
+                    process.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            _, alive = psutil.wait_procs(owned, timeout=5)
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            if self._thread is not None and self._thread is not threading.current_thread():
+                self._thread.join(timeout=5)
+            return
         for p in procs:
             try:
                 os.killpg(p.pid, signal.SIGTERM)

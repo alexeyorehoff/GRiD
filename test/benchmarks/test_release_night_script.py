@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,12 +16,12 @@ SCRIPT = ROOT / "test/benchmarks/timing_night.sh"
 def run(*args):
     # The interpreter running this test has the dev stack; the script must not
     # depend on a repository venv (CI has none).
-    env = {**os.environ, "PYTHON": sys.executable}
-    return subprocess.run(["bash", str(SCRIPT), *args], cwd=ROOT, text=True, capture_output=True, env=env)
+    env = {**os.environ, "PYTHON": Path(sys.executable).as_posix()}
+    return subprocess.run([shutil.which("bash"), str(SCRIPT), *args], cwd=ROOT, text=True, capture_output=True, env=env)
 
 
 def test_syntax_and_help():
-    assert subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True).returncode == 0
+    assert subprocess.run([shutil.which("bash"), "-n", str(SCRIPT)], capture_output=True).returncode == 0
     out = run("--help")
     assert out.returncode == 0
     for word in ("gaps", "release", "tutorial", "report", "--resume", "--dry-run", "--stages"):

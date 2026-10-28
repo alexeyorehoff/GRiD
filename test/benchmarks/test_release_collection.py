@@ -1,6 +1,7 @@
 """CPU-only regression tests for the release measurement/reporting contract."""
 import ctypes
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -263,8 +264,18 @@ def test_jax_cache_environment_is_persistent_and_owner_controlled(tmp_path,monke
     env=collect.worker_environment()
     assert env['JAX_COMPILATION_CACHE_DIR']==str(cache)
     assert env['JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS']=='0'
-    assert cache.stat().st_mode & 0o777 == 0o700
-    cache.chmod(0o777)
+    if os.name == 'nt':
+        import win32security
+        assert collect._cache_owner_controlled(cache)
+        descriptor = win32security.GetFileSecurity(str(cache), win32security.DACL_SECURITY_INFORMATION)
+        acl = descriptor.GetSecurityDescriptorDacl()
+        acl.AddAccessAllowedAce(win32security.ACL_REVISION, 2,
+                               win32security.CreateWellKnownSid(win32security.WinWorldSid))
+        descriptor.SetSecurityDescriptorDacl(True, acl, False)
+        win32security.SetFileSecurity(str(cache), win32security.DACL_SECURITY_INFORMATION, descriptor)
+    else:
+        assert cache.stat().st_mode & 0o777 == 0o700
+        cache.chmod(0o777)
     with pytest.raises(PermissionError):collect.worker_environment()
 
 
@@ -332,7 +343,8 @@ def test_oracle_loader_builds_once_and_rejects_stale_result(tmp_path, monkeypatc
     loader = oracle_loader()
     monkeypatch.setattr(loader, '_DIR', tmp_path)
     monkeypatch.setattr(sys, 'path', list(sys.path))
-    so = tmp_path / 'pin_so_ext.test.so'
+    import sysconfig
+    so = tmp_path / ('pin_so_ext' + sysconfig.get_config_var('EXT_SUFFIX'))
     source = tmp_path / 'setup.py'
     source.touch()
     built = []
@@ -582,7 +594,7 @@ def test_cli_dry_run_and_bad_tool_no_gpu_needed():
 
 def test_timeout_terminates_worker(tmp_path):
     rc,expired=run_job([sys.executable,"-c","import time; time.sleep(30)"],tmp_path/"worker.log",.1)
-    assert expired and rc < 0
+    assert expired and rc != 0
 
 
 def test_native_bridge_cpu_fake_abi(tmp_path):
@@ -591,7 +603,9 @@ def test_native_bridge_cpu_fake_abi(tmp_path):
     source.write_text('extern "C" int grid_rbd_inverse_dynamics(long long c,const float*q,const float*v,const float*a,float*out,int b,float g,const float*f){for(int i=0;i<b;++i)out[i]=q[i]+v[i]+a[i];return c==99?-9:0;}')
     fake=tmp_path/"fake.so"; bridge=tmp_path/"bridge.so"
     for src,out in [(source,fake),(Path(p.__file__).with_name("native_bridge.cpp"),bridge)]:
-        subprocess.run(["g++","-std=c++17","-shared","-fPIC",str(src),"-ldl","-o",str(out)],check=True)
+        from test.benchmarks.release.native_build import shared_command
+        symbol = "grid_rbd_inverse_dynamics" if src == source else "grid_release_time"
+        subprocess.run(shared_command(src, out, exports=(symbol,)), check=True)
     lib=ctypes.CDLL(str(bridge)); fn=lib.grid_release_time
     fp=ctypes.POINTER(ctypes.c_float); dp=ctypes.POINTER(ctypes.c_double)
     fn.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_longlong,fp,fp,fp,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_double,dp,fp]
@@ -608,7 +622,7 @@ def test_native_bridge_cpu_fake_abi(tmp_path):
 def test_release_pool_runs_every_slice_once_on_persistent_threads(tmp_path):
     """The C++ pool behind the CPU baselines, compiled into a fake TU without Pinocchio."""
     source=tmp_path/"pool.cpp"
-    source.write_text('#include "release_pool.h"\n#include <atomic>\n#include <thread>\n'
+    source.write_text('#include "release_pool.h"\n#include <algorithm>\n#include <atomic>\n#include <thread>\n'
         'extern "C" int pool_probe(int helpers,int active,int rounds,int*hits,int*distinct_threads){\n'
         '  ReleasePool pool((std::size_t)helpers); std::atomic<int> bad{0};\n'
         '  std::mutex m; std::vector<std::thread::id> seen;\n'
@@ -623,7 +637,8 @@ def test_release_pool_runs_every_slice_once_on_persistent_threads(tmp_path):
         '  std::sort(seen.begin(),seen.end()); *distinct_threads=(int)(std::unique(seen.begin(),seen.end())-seen.begin());\n'
         '  return bad? -1 : (int)pool.capacity(); }\n')
     lib=tmp_path/"pool.so"
-    subprocess.run(["g++","-std=c++17","-O2","-shared","-fPIC","-pthread",f"-I{Path(p.__file__).parent}",str(source),"-o",str(lib)],check=True)
+    from test.benchmarks.release.native_build import shared_command
+    subprocess.run(shared_command(source, lib, exports=("pool_probe",), include_dirs=(Path(p.__file__).parent,)), check=True)
     probe=ctypes.CDLL(str(lib)).pool_probe
     ip=ctypes.POINTER(ctypes.c_int)
     probe.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_int,ip,ip]
@@ -790,7 +805,7 @@ def test_report_uncollected_placeholder_never_shadows_a_later_collected_cell(tmp
     table=json.loads((out/'table.json').read_text())
     assert [r['status'] for r in table['raw_records']]==['validated']
     assert table['raw_records'][0]['capture']==str(later/'capture.json')
-    assert len(table['superseded_cells'])==1 and table['superseded_cells'][0]['capture'].endswith('dead/plan.json')
+    assert len(table['superseded_cells'])==1 and Path(table['superseded_cells'][0]['capture']).parts[-2:]==('dead', 'plan.json')
     assert 'never collected' in table['superseded_cells'][0]['reason']
     assert table['cells'][0]['status']=='validated' and table['cells'][0]['host_us']==10.
 

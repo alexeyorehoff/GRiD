@@ -2902,12 +2902,14 @@ def gen_update_XmatHom_joint(self):
     self.gen_add_end_function()       # close function
 
 def gen_ee_pose_inner_parent_lookup(self, parents):
-    # Emit a constant lookup expression mapping the loop index j -> parent id.
+    # Emit a constant table and return the lookup mapping j -> parent id.
     # For a serial chain this is just (j-1); otherwise emit a small static table.
     if all(parents[j] == j - 1 for j in range(len(parents))):
         return "j - 1"
     arr = "{" + ",".join(str(p) for p in parents) + "}"
-    return "((const int[]) " + arr + ")[j]"
+    # C99 compound literals are a GNU C++ extension rejected by MSVC/nvcc.
+    self.gen_add_code_line("const int grid_ee_parents[] = " + arr + ";")
+    return "grid_ee_parents[j]"
 
 def gen_ee_pose_inner_warp(self):
     import sympy as sp

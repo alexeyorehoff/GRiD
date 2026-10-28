@@ -168,7 +168,7 @@ def rebind_sphere_model(spheres, target, out_path, fidelity=True):
             sp.set('radius', '{:.9g}'.format(r))
             total += 1
     body = ET.tostring(root, encoding='unicode')
-    out_path.write_text(body)
+    out_path.write_text(body, encoding="utf-8")
     validate_sphere_model(target, out_path)
     provenance = {
         'source': spheres.name, 'source_sha256': hashlib.sha256(spheres.read_bytes()).hexdigest(),
@@ -195,7 +195,7 @@ def rebind_sphere_model(spheres, target, out_path, fidelity=True):
     header = ('<!-- grid-spherize rebind: spheres of {source} (sha256 {source_sha256}) re-attached by link name to '
               '{target} (sha256 {target_sha256}); {spheres} spheres on {links} links; {fidelity}; '
               'content sha256 {content_sha256} -->\n').format(**provenance)
-    out_path.write_text(header + body)
+    out_path.write_text(header + body, encoding="utf-8")
     return provenance
 
 

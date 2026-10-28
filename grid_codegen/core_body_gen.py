@@ -260,7 +260,7 @@ def gen_region() -> str:
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    text = CORE_PATH.read_text()
+    text = CORE_PATH.read_text(encoding="utf-8")
     if BEGIN not in text or END not in text:
         print("core_body_gen: no generated-region markers in _core.cpp yet — "
               "printing the region to stdout (offline-proof mode)")
@@ -276,7 +276,7 @@ def main(argv=None):
             return 1
         print("core_body_gen --check: clean")
         return 0
-    CORE_PATH.write_text(new)
+    CORE_PATH.write_text(new, encoding="utf-8", newline="\n")
     print(f"core_body_gen: region rewritten ({len(gen_region().splitlines())} lines)")
     return 0
 

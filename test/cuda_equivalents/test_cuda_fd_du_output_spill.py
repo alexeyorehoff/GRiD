@@ -16,11 +16,13 @@ checked against pinocchio elsewhere) AND thread-count invariant. GRiD-vs-GRiD bi
 equality is a stronger, convention-free check of the spill than an oracle comparison.
 
 Every manifest robot on both bases by default (widened 2026-10-15). The
-reference build is the rung the 98304-byte production target picks for that
-robot: the full rung for the small and mid robots, the selective rung (1) for
+reference build starts with the rung the 98304-byte production target picks for
+that robot, lowering the target to the device's actual capacity when needed:
+the full rung for the small and mid robots, the selective rung (1) for
 g1-floating (full arena 86944 bytes) and the emergency rung (2) for h1_2 on both
 bases (full arenas 38464 / 45008 bytes only after the selective spill; the full
-rung is above the target). The forced output-spill rung must be bit-identical
+rung is above the target). Smaller GPUs use the emergency rung for g1-floating.
+The forced output-spill rung must be bit-identical
 to whichever rung that is, which is the relocation claim.
 Narrow with GRID_CUDA_FD_DU_SPILL_ROBOTS="iiwa14:fixed,go2:floating".
 """
@@ -43,13 +45,12 @@ from RBDReference.tests.model_sources import iter_robot_cases, resolve_robot_spe
 from RBDReference.equivalents.reference_backend import build_project_adapter
 from test.cuda_equivalents.cuda_harness import _detect_cuda_arch
 
-# fd_du needs these (+ its id/minv/fd composition); crba/aba/end_effector_pose are
-# launched unconditionally by cuda_equivalence_runner.cu's value block. NONE are
-# second-order, so a forced-low target spills only the first-order ladders (cheap
-# compile) and never the 4*NV^3 SO contract.
+# Keep the dependencies of fd_du's composition. The dedicated runner launches
+# only fd_du, so unrelated value kernels cannot exhaust shared memory first.
+# None are second-order: forced-low targets never enter the 4*NV^3 SO contract.
 _SUBSET = ["inverse_dynamics", "minv", "forward_dynamics", "crba", "aba",
            "end_effector_pose", "inverse_dynamics_gradient", "forward_dynamics_gradient"]
-_RUNNER = Path(__file__).with_name("cuda_equivalence_runner.cu")
+_RUNNER = Path(__file__).with_name("cuda_fd_du_output_spill_runner.cu")
 
 
 _ALL_ROBOTS = ("iiwa14", "go2", "g1", "h1_2", "fr3", "rizon4", "gen3", "fetch", "baxter")
@@ -104,10 +105,6 @@ def _compile(build_dir, arch, floating):
     if shutil.which("nvcc") is None and not Path(nvcc).exists():
         pytest.skip("nvcc not found; install CUDA Toolkit to run CUDA tests.")
     shutil.copyfile(_RUNNER, build_dir / "runner.cu")
-    # The runner #includes "grid_runner_select.cuh" (split scaffold, monolith-inert);
-    # copy it next to the runner copy so the isolated-dir compile resolves it.
-    shutil.copyfile(_RUNNER.with_name("grid_runner_select.cuh"),
-                    build_dir / "grid_runner_select.cuh")
     glass = Path(__file__).resolve().parents[2] / "external" / "GLASS" / "include"
     exe = build_dir / "runner.exe"
     # GRID_CUDA_FLOATING_BASE selects the runner's floating section, whose fd_grad
@@ -117,11 +114,11 @@ def _compile(build_dir, arch, floating):
     # "qd" block whenever the fresh allocation isn't zero.
     cmd = [nvcc, "-std=c++17", "-O0", "-gencode", f"arch=compute_{arch},code=sm_{arch}",
            f"-DGRID_CUDA_FLOATING_BASE={1 if floating else 0}",
-           "-DGRID_RUNNER_SKIP_GRADIENTS=0", "-DGRID_RUNNER_SKIP_EEPOSE_GRADIENTS=1",
            f"-I{glass}", f"-I{build_dir}", "-o", str(exe), str(build_dir / "runner.cu")]
     res = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True)
     if res.returncode != 0:
-        pytest.fail(f"fd_du spill runner compile failed.\n{' '.join(cmd)}\n{res.stderr[-3000:]}")
+        pytest.fail(f"fd_du spill runner compile failed.\n{' '.join(cmd)}\n"
+                    f"{res.stdout[-3000:]}\n{res.stderr[-3000:]}")
     return exe
 
 
@@ -169,8 +166,19 @@ def test_cuda_fd_du_output_spill_matches_full(tmp_path, robot_id, base_mode):
     full_dir = tmp_path / "full"
     full_dir.mkdir()
     full_pick, cg_full = _gen_header(robot, full_dir, 98304)
-    assert full_pick <= 2, f"expected an unspilled-output fd_du rung (pick 0-2) at the default target, got {full_pick}"
     full_exe = _compile(full_dir, arch, base_mode == "floating")
+    capacity = int(subprocess.check_output(
+        [str(full_exe), "--shared-memory-capacity"], text=True).strip())
+    # The reference must fit the actual device and retain an unspilled output.
+    # In particular, g1-floating's selective rung needs more than sm_75's 64 KiB;
+    # its emergency rung still fits and differs from the output-spill rung.
+    reference_bytes = _py_arena_bytes(
+        cg_full.forward_dynamics_gradient_t_count_per_tier[0],
+        cg_full.gen_topology_helpers_size())
+    if reference_bytes > capacity:
+        full_pick, cg_full = _gen_header(robot, full_dir, capacity)
+        full_exe = _compile(full_dir, arch, base_mode == "floating")
+    assert full_pick <= 2, f"expected an unspilled-output fd_du rung (pick 0-2) at the default target, got {full_pick}"
 
     # OUTPUT-SPILL build: force the rung by codegen'ing one byte below the emergency
     # arena (the 4 arenas decrease with spill: full > selective > emergency > output).

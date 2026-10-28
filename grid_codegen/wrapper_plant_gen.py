@@ -62,6 +62,7 @@ PLANT_STEP_OPS = {
         gate="GRID_PLANT_HAS_STEP_GRADIENT",
         kernel="plant_step_gradient_kernel",
         smem="INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES",
+        tier="grid::launch_cfg<grid::GRID_ALGO_INTEGRATOR_GRADIENT>::TIER",
         check="plant_step_gradient_kernel",
         name="plant_step_gradient",
         jax_comment=[
@@ -148,6 +149,8 @@ COST_OPS = {
 def _jax_step_block(key: str) -> list[str]:
     op = PLANT_STEP_OPS[key]
     name, kern, smem = op["name"], op["kernel"], op["smem"]
+    tier = ", " + op["tier"] if "tier" in op else ""
+    workspace = ", g_data->d_workspace" if "tier" in op else ""
     L = [f"#ifdef {op['gate']}"]
     L += op["jax_comment"]
     L += [
@@ -156,13 +159,13 @@ def _jax_step_block(key: str) -> list[str]:
         "    GRID_RBD_CTX_LOCALS(ctx);",
         *op["launcher_decls"],
         "    dim3 grid_dim = grid_rbd_grid_for(g_ctx, batch);",
-        f"    const size_t smem = grid::{smem}<T>();",
-        f"    cudaFuncSetAttribute(grid_plant::{kern}<T, IT, MUJOCO>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);",
-        f"    dim3 thr = grid_clamp_threads_for(grid_plant::{kern}<T, IT, MUJOCO>, grid_rbd_launch_threads_n<grid::GRID_ALGO_COUNT>(g_ctx, batch));",
-        f"    grid_plant::{kern}<T, IT, /*MUJOCO_OUTPUT=*/MUJOCO><<<grid_dim, thr,",
+        f"    const size_t smem = grid::{smem}<T{tier}>();",
+        f"    cudaFuncSetAttribute(grid_plant::{kern}<T, IT, MUJOCO{tier}>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);",
+        f"    dim3 thr = grid_clamp_threads_for(grid_plant::{kern}<T, IT, MUJOCO{tier}>, grid_rbd_launch_threads_n<grid::GRID_ALGO_COUNT>(g_ctx, batch));",
+        f"    grid_plant::{kern}<T, IT, /*MUJOCO_OUTPUT=*/MUJOCO{tier}><<<grid_dim, thr,",
         "        smem, stream>>>(",
         "            g_plant.d_grad, g_plant.d_in_a, g_plant.d_in_b,",
-        f"            {op['dim_args']}, g_robot, (T)gravity, (T)dt, batch);",
+        f"            {op['dim_args']}, g_robot, (T)gravity, (T)dt, batch{workspace});",
         "}",
         "",
         op["mjx_comment"],
@@ -379,6 +382,8 @@ def gen_jax_plant_tail() -> str:
 def _torch_step_block(key: str) -> list[str]:
     op = PLANT_STEP_OPS[key]
     name, kern, smem = op["name"], op["kernel"], op["smem"]
+    tier = ", " + op["tier"] if "tier" in op else ""
+    workspace = ", g_data->d_workspace" if "tier" in op else ""
     L = [f"#ifdef {op['gate']}"]
     L += [
         "template <grid::IntegratorType IT, bool MUJOCO>",
@@ -392,13 +397,13 @@ def _torch_step_block(key: str) -> list[str]:
         L.append("    const int nx = grid::NUM_POS + grid::NUM_VEL, nv = grid::NUM_VEL;")
     L += [
         "    dim3 grid_dim = grid_rbd_grid_for(g_ctx, batch);",
-        f"    const size_t smem = grid::{smem}<T>();",
-        f"    cudaFuncSetAttribute(grid_plant::{kern}<T, IT, MUJOCO>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);",
-        f"    dim3 thr = grid_clamp_threads_for(grid_plant::{kern}<T, IT, MUJOCO>, grid_rbd_launch_threads_n<grid::GRID_ALGO_COUNT>(g_ctx, batch));",
-        f"    grid_plant::{kern}<T, IT, /*MUJOCO_OUTPUT=*/MUJOCO><<<grid_dim, thr,",
+        f"    const size_t smem = grid::{smem}<T{tier}>();",
+        f"    cudaFuncSetAttribute(grid_plant::{kern}<T, IT, MUJOCO{tier}>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);",
+        f"    dim3 thr = grid_clamp_threads_for(grid_plant::{kern}<T, IT, MUJOCO{tier}>, grid_rbd_launch_threads_n<grid::GRID_ALGO_COUNT>(g_ctx, batch));",
+        f"    grid_plant::{kern}<T, IT, /*MUJOCO_OUTPUT=*/MUJOCO{tier}><<<grid_dim, thr,",
         "        smem, stream>>>(",
         "            g_plant.d_grad, g_plant.d_in_a, g_plant.d_in_b,",
-        f"            {op['dim_args'] if key != 'plant_step' else 'nx, grid::NUM_VEL'}, g_robot, (T)gravity, (T)dt, batch);",
+        f"            {op['dim_args'] if key != 'plant_step' else 'nx, grid::NUM_VEL'}, g_robot, (T)gravity, (T)dt, batch{workspace});",
         "}",
         "",
         "template <bool MUJOCO>",
@@ -555,7 +560,7 @@ def plant_tail_spans(text: str) -> dict[str, tuple[int, int]]:
 
 def rewrite_plant_tails() -> bool:
     """Replace both tails with the emitted text; returns True if bytes changed."""
-    text = _TEMPLATE.read_text()
+    text = _TEMPLATE.read_text(encoding="utf-8")
     lines = text.split("\n")
     spans = plant_tail_spans(text)
     # splice torch first (later in the file) so jax indices stay valid
@@ -565,7 +570,7 @@ def rewrite_plant_tails() -> bool:
     out = "\n".join(lines)
     changed = out != text
     if changed:
-        _TEMPLATE.write_text(out)
+        _TEMPLATE.write_text(out, encoding="utf-8", newline="\n")
     return changed
 
 

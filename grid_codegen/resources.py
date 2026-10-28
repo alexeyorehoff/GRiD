@@ -39,7 +39,7 @@ def resource_path(name):
 
 def bundled_provenance():
     path = data_dir() / 'provenance.json'
-    return json.loads(path.read_text()) if path.is_file() else None
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
 def collision_include_dir():

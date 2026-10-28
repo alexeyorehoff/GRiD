@@ -21,11 +21,42 @@ from .protocol import ACCURACY_POLICIES, ACCURACY_POLICY_VERSION, FD_WARNING_MAX
 JAX_CACHE = ROOT / "test/benchmarks/results/release-jax-cache"
 
 
+def _cache_owner_controlled(path):
+    if os.name != "nt":
+        stat = path.stat()
+        return stat.st_uid == os.getuid() and not stat.st_mode & 0o022
+    import win32api
+    import win32con
+    import win32security
+    descriptor = win32security.GetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION |
+                                               win32security.DACL_SECURITY_INFORMATION)
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    try:
+        user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    finally:
+        token.Close()
+    if descriptor.GetSecurityDescriptorOwner() != user:
+        return False
+    acl = descriptor.GetSecurityDescriptorDacl()
+    if acl is None:
+        return False
+    trusted = (user, win32security.CreateWellKnownSid(win32security.WinLocalSystemSid),
+               win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid),
+               win32security.CreateWellKnownSid(win32security.WinCreatorOwnerSid),
+               win32security.ConvertStringSidToSid("S-1-3-4"))  # OWNER RIGHTS
+    write_access = 0x40000000 | 0x10000000 | 0x000D0156
+    for i in range(acl.GetAceCount()):
+        ace = acl.GetAce(i)
+        if ace[0][0] in (win32security.ACCESS_ALLOWED_ACE_TYPE, win32security.ACCESS_ALLOWED_OBJECT_ACE_TYPE):
+            if ace[1] & write_access and ace[-1] not in trusted:
+                return False
+    return True
+
+
 def worker_environment():
     # Executable cache: local, owner-controlled, never supplied by a third party.
     JAX_CACHE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stat = JAX_CACHE.stat()
-    if stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+    if not _cache_owner_controlled(JAX_CACHE):
         raise PermissionError(f"JAX cache must be owner-controlled: {JAX_CACHE}")
     return {**os.environ, "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
             "JAX_DEFAULT_MATMUL_PRECISION": "highest", "JAX_ENABLE_X64": "false",
@@ -82,24 +113,20 @@ def provenance():
 def run_job(cmd, log, timeout):
     """Kill the entire compiler/worker process group on timeout, not just Python."""
     with log.open("w") as stream:
+        from test.processes import start_process_tree, terminate_process_tree
         env = worker_environment()
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
+        proc, owned_job = start_process_tree(cmd, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                                 start_new_session=True, env=env)
         try:
             return proc.wait(timeout=timeout), False
         except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+            terminate_process_tree(proc, owned_job)
             if isinstance(error, KeyboardInterrupt):
                 raise
             return proc.returncode, True
+        finally:
+            if owned_job is not None:
+                owned_job.Close()
 
 
 def main():

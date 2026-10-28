@@ -64,7 +64,8 @@ def test_fixed_base_mujoco_convention_is_noop_jax_torch():
     setter semantics): output_convention="mujoco" on a fixed base is accepted
     (previously a ValueError — clean-break unification to the numpy semantics)
     and every call is a pin-identical no-op, including the .mujoco view."""
-    jax_mod = pytest.importorskip("grid_rbd.jax", reason="grid_rbd.jax import failed")
+    pytest.importorskip("jax", reason="jax not installed")
+    import grid_rbd.jax as jax_mod
     torch_mod = pytest.importorskip("grid_rbd.torch", reason="grid_rbd.torch import failed")
     import torch
 

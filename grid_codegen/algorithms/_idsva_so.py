@@ -5076,12 +5076,12 @@ def gen_idsva_so_dispatcher_host(self, mode = 0):
         ])
         self.gen_add_code_line("// then call the kernel")
         self.gen_add_code_line(f"gpuErrchk(grid_check_dynamic_shared_memory_bytes(\"idsva_so\", {smem_macro}));")
-        self.gen_add_code_line("struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+        self.gen_add_code_line("struct timespec start, end; grid_clock_now(&start);")
         self.gen_add_code_line(
             f"{kernel_tmpl}<<<block_dimms,thread_dimms,{smem_macro}>>>(hd_data->d_idsva_so,{kernel_workspace_arg}hd_data->d_q_qd_u,stride_q_qd,d_robotModel,gravity,num_timesteps);"
         )
         self.gen_add_code_line("gpuErrchkKernel();")
-        self.gen_add_code_line("clock_gettime(CLOCK_MONOTONIC,&end);")
+        self.gen_add_code_line("grid_clock_now(&end);")
         self.gen_add_code_lines([
             "// finally transfer the result back",
             "gpuErrchk(cudaMemcpy(hd_data->h_idsva_so,hd_data->d_idsva_so,SECOND_ORDER_TENSOR_SIZE*sizeof(T),cudaMemcpyDeviceToHost));",

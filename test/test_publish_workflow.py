@@ -1,9 +1,10 @@
 """CPU-only guards for receipt ancestry and publication boundaries."""
 from pathlib import Path
-import fcntl
+from grid_codegen import _filelock as fcntl
 import json
 import os
 import subprocess
+import shutil
 import sys
 
 import pytest
@@ -50,21 +51,21 @@ def test_docker_header_generation_creates_output_directory(tmp_path):
                if line.startswith('RUN ') and 'grid-generate ' in line)
     # The following Python import/version print is independent of directory setup.
     command = run.split('&& python -c', 1)[0]
-    command = command.replace('/opt/grid', str(tmp_path / 'grid'))
+    command = command.replace('/opt/grid', (tmp_path / 'grid').as_posix())
     executable = tmp_path / 'grid-generate'
     executable.write_text(
-        f'#!{sys.executable}\n'
+        f'#!{Path(sys.executable).as_posix()}\n'
         'import pathlib, sys\n'
-        'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("header\\n")\n'
-    )
+        'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("header\\n")\n',
+        newline='\n')
     executable.chmod(0o755)
     env = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ['PATH'])
     # The original recipe omitted mkdir; the same writer must fail in that case.
     old_command = command[command.index('grid-generate '):]
-    result = subprocess.run(['sh', '-ec', old_command], env=env, capture_output=True,
+    result = subprocess.run([shutil.which('sh'), '-ec', old_command], env=env, capture_output=True,
                             text=True)
     assert result.returncode != 0 and 'FileNotFoundError' in result.stderr
-    subprocess.run(['sh', '-ec', command], env=env, check=True, capture_output=True)
+    subprocess.run([shutil.which('sh'), '-ec', command], env=env, check=True, capture_output=True)
     assert (tmp_path / 'grid/iiwa14/grid.cuh').read_text() == 'header\n'
 
 
@@ -78,13 +79,15 @@ def test_container_smoke_protocol(tmp_path, scenario):
     bin_dir.mkdir()
     calls = tmp_path / 'calls.jsonl'
     stub = (
-        f'#!{sys.executable}\n'
+        f'#!{Path(sys.executable).as_posix()}\n'
         'import json, os, pathlib, sys\n'
         'tool = pathlib.Path(sys.argv[0]).name\n'
         'args = sys.argv[1:]\n'
         'scenario = os.environ["SMOKE_SCENARIO"]\n'
         'with open(os.environ["SMOKE_CALLS"], "a") as f:\n'
         '    f.write(json.dumps([tool, args]) + "\\n")\n'
+        'if tool == "flock":\n'
+        '    sys.exit(1 if scenario == "busy-lock" else 0)\n'
         'if tool == "pgrep":\n'
         '    sys.exit(0 if scenario == "compiler-busy" else 1)\n'
         'if tool == "nvidia-smi":\n'
@@ -104,20 +107,26 @@ def test_container_smoke_protocol(tmp_path, scenario):
         'if scenario == "baked-failure" and "/checks/baked.py" in args: sys.exit(42)\n'
         'if scenario == "reload-failure" and "--reload" in args: sys.exit(42)\n'
     )
-    for name in ('docker', 'nvidia-smi', 'pgrep'):
+    # Git for Windows has no util-linux flock. Stub that shell command's
+    # busy/success verdict too; real cache lock exclusion is tested separately.
+    tools = ('docker', 'nvidia-smi', 'pgrep', 'flock') if os.name == 'nt' else ('docker', 'nvidia-smi', 'pgrep')
+    for name in tools:
         executable = bin_dir / name
-        executable.write_text(stub)
+        executable.write_text(stub, newline='\n')
         executable.chmod(0o755)
     lock = tmp_path / 'shared.lock'
     lock.touch()
     env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'],
-               TMPDIR=str(tmp_path), GRID_CONTAINER_TIMING_LOCK=str(lock),
+               TMPDIR=tmp_path.as_posix(), GRID_CONTAINER_TIMING_LOCK=lock.as_posix(),
                SMOKE_SCENARIO=scenario, SMOKE_CALLS=str(calls))
-    with lock.open('r') as held:
+    if os.name == 'nt':
+        env['MSYS2_ARG_CONV_EXCL'] = '/checks/;/work/;type=bind,'
+    with lock.open('r+b' if os.name == 'nt' else 'r') as held:
         if scenario == 'busy-lock':
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result = subprocess.run(['bash', str(ROOT / 'tools/check_container_image.sh'), '0.5.3'],
+        result = subprocess.run([shutil.which('bash'), str(ROOT / 'tools/check_container_image.sh'), '0.5.3'],
                                 env=env, capture_output=True, text=True, timeout=15)
+    assert calls.exists(), result.stdout + result.stderr
     records = [json.loads(line) for line in calls.read_text().splitlines()]
     runs = [args for tool, args in records if tool == 'docker' and args[2] == 'run']
     outputs = list(tmp_path.glob('grid-container-smoke-*'))

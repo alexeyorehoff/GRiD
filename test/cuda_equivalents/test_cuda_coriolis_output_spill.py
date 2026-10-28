@@ -9,8 +9,12 @@ full arena is ~121KB > sm_120's ~99KB (UNLAUNCHABLE); the output-spill rung is ~
 
 The spill RELOCATES buffers; it must not change C(q,qd). This test forces each spill
 rung at codegen (a low GRID_CUDA_TARGET_SHARED_MEM_BYTES) and asserts the host-wrapper
-output is BIT-IDENTICAL to the unspilled full-smem rung (the oracle-validated path,
-checked vs pinocchio in test_cuda_coriolis.py) AND thread-count invariant. A coriolis-
+output is BIT-IDENTICAL across the generated variants AND thread-count invariant.
+The runner selects an existing resource tier that fits the GPU; the full-smem
+rung is exercised when it fits, and smaller GPUs exercise the available spilled
+tiers. Every variant is also checked directly against the independent NumPy
+Coriolis reference, including when hardware requires the same fallback tier.
+A coriolis-
 only codegen subset keeps the SO kernels out of the header so the forced-low target does
 not trigger their pathological deep-spill compile wall.
 
@@ -86,7 +90,7 @@ def _gen(robot, build_dir, target):
     return cg.coriolis_matrix_spill_tier_3way[0], cg
 
 
-def _compile(build_dir, arch):
+def _compile(build_dir, arch, floating_base=False):
     nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
     if shutil.which("nvcc") is None and not Path(nvcc).exists():
         pytest.skip("nvcc not found; install CUDA Toolkit to run CUDA tests.")
@@ -94,7 +98,8 @@ def _compile(build_dir, arch):
     glass = Path(__file__).resolve().parents[2] / "external" / "GLASS" / "include"
     exe = build_dir / "runner.exe"
     cmd = [nvcc, "-std=c++17", "-O0", "-gencode", f"arch=compute_{arch},code=sm_{arch}",
-           "-DGRID_CUDA_CORIOLIS_TEST_THREADS=64", f"-I{glass}", f"-I{build_dir}",
+           "-DGRID_CUDA_CORIOLIS_TEST_THREADS=64", f"-DGRID_CUDA_FLOATING_BASE={int(floating_base)}",
+           f"-I{glass}", f"-I{build_dir}",
            "-o", str(exe), str(build_dir / "runner.cu")]
     res = subprocess.run(cmd, cwd=build_dir, capture_output=True, text=True)
     if res.returncode != 0:
@@ -137,19 +142,19 @@ def test_cuda_coriolis_spill_matches_full(tmp_path, robot_id, base_mode):
     topo = cg_full.gen_topology_helpers_size()
     full_t = cg_full.coriolis_matrix_t_count_per_tier[0]
     out_t = full_t - nv * nv  # output-spill arena
-    full_exe = _compile(full_dir, arch)
+    full_exe = _compile(full_dir, arch, base_mode == "floating")
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     out_pick, _ = _gen(robot, out_dir, _py_arena_bytes(full_t, topo) - 1)
     assert out_pick == 1, f"forced target did not land coriolis output-spill rung (got {out_pick})"
-    out_exe = _compile(out_dir, arch)
+    out_exe = _compile(out_dir, arch, base_mode == "floating")
 
     whole_dir = tmp_path / "whole"
     whole_dir.mkdir()
     whole_pick, _ = _gen(robot, whole_dir, _py_arena_bytes(out_t, topo) - 1)
     assert whole_pick == 2, f"forced target did not land coriolis whole-band rung (got {whole_pick})"
-    whole_exe = _compile(whole_dir, arch)
+    whole_exe = _compile(whole_dir, arch, base_mode == "floating")
 
     rng = np.random.default_rng(_stable_seed(robot_id))
     for trial in range(3):
@@ -157,6 +162,10 @@ def test_cuda_coriolis_spill_matches_full(tmp_path, robot_id, base_mode):
         qd = rng.uniform(-1.0, 1.0, nv)
         ref = _run(full_exe, q, qd, 64)
         tag = f"{robot_id}-{base_mode} trial {trial}"
+        expected = np.asarray(pm.reference.coriolis_matrix(q, qd), dtype=np.float64).reshape(-1)
+        scale = max(1.0, float(np.max(np.abs(expected))))
+        np.testing.assert_allclose(ref, expected, rtol=5e-3, atol=5e-3 * scale,
+                                   err_msg=f"{tag}: CUDA C != independent reference")
         np.testing.assert_array_equal(_run(out_exe, q, qd, 64), ref,
                                       err_msg=f"{tag}: output-spill C != full C")
         np.testing.assert_array_equal(_run(whole_exe, q, qd, 64), ref,

@@ -114,7 +114,7 @@ def load_launch_config(robot_id, floating_base, gpu = LAUNCH_CONFIG_DEFAULT_GPU,
         except OSError:
             pass
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             doc = json.load(f)
     except (OSError, ValueError):
         return {}

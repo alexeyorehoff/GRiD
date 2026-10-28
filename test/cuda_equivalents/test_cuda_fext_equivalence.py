@@ -79,17 +79,15 @@ def _gen_and_compile(proj, build_dir, floating_base):
     )
     import contextlib
     with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-        # SPLIT codegen: exactly the families the monolith runner exercises with
-        # f_ext inputs (core dynamics + gradients + ee family). Skips the SO/
-        # integrator/centroidal/regressor emitters — they dominate full-profile
-        # codegen time and this runner never references them.
+        # Generate and launch only the five dynamics families whose f_ext
+        # outputs this test checks. Unrelated minv and EE launches can exhaust
+        # shared memory before any external-force result is checked.
         codegen.gen_all_code(
             include_homogenous_transforms=True, output_path=str(header),
             algorithm_list=[
                 "inverse_dynamics", "inverse_dynamics_gradient",
                 "forward_dynamics", "forward_dynamics_gradient",
-                "minv", "aba", "crba",
-                "end_effector_pose", "end_effector_pose_gradient", "end_effector_pose_hessian",
+                "aba",
             ],
         )
     nvcc = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
@@ -106,6 +104,9 @@ def _gen_and_compile(proj, build_dir, floating_base):
     exe = build_dir / "cuda_fext_runner.exe"
     cmd = [
         nvcc, "-std=c++11", "-O0",
+        "-DGRID_RUN_SPLIT",
+        "-DRUN_INVERSE_DYNAMICS=1", "-DRUN_FORWARD_DYNAMICS=1", "-DRUN_ABA=1",
+        "-DRUN_INVERSE_DYNAMICS_GRADIENT=1", "-DRUN_FORWARD_DYNAMICS_GRADIENT=1",
         f"-DGRID_CUDA_FLOATING_BASE={1 if floating_base else 0}",
         "-DGRID_CUDA_LINALG_BACKEND=GRID_LINALG_GLASS",
         "-gencode", f"arch=compute_{arch},code=sm_{arch}",

@@ -32,6 +32,7 @@ class FakeNvcc:
 def env(monkeypatch, tmp_path):
     fake = FakeNvcc()
     monkeypatch.setattr(_compile.subprocess, "run", fake)
+    monkeypatch.setattr(_compile, "_windows_export_flags", lambda objects: [])
     for fn in ("_nvcc_identity", "_host_cxx_tag", "_glass_content_hash", "_torch_abi_tag", "_jax_ffi_tag"):
         monkeypatch.setattr(_cache, fn, lambda fn=fn: fn)
     monkeypatch.setenv("GRID_RBD_BUILD_JOBS", "2")
@@ -43,6 +44,22 @@ def env(monkeypatch, tmp_path):
     (src / "wrapper_kinematics.cu").write_text("// kinematics v1\n")
     (src / "wrapper_dyn_values.cu").write_text("// dyn_values v1\n")
     return fake, src, tmp_path / "objects"
+
+
+def test_windows_exports_definitions_and_omits_unresolved_or_cpp_symbols(monkeypatch):
+    table = "\n".join([
+        "001 00000000 SECT1 notype () External | grid_rbd_init",
+        "002 00000000 SECT2 notype () External | grid_plant_quadratic_state_cost",
+        "003 00000000 SECT3 notype () External | grid_rbd_jax_forward_dynamics",
+        "004 00000000 UNDEF notype () External | grid_rbd_optional_not_built",
+        "005 00000000 SECT4 notype () External | ?grid_rbd_ctx_acquire@@YAPEAX_J@Z",
+    ])
+    monkeypatch.setattr(_compile.subprocess, "check_output", lambda *args, **kwargs: table)
+    assert _compile._windows_export_flags(["a.obj", "b.obj"]) == [
+        "-Xlinker=/EXPORT:grid_plant_quadratic_state_cost",
+        "-Xlinker=/EXPORT:grid_rbd_init",
+        "-Xlinker=/EXPORT:grid_rbd_jax_forward_dynamics",
+    ]
 
 
 def _build(src, objects, *, reuse=True, core_flags=None, flags=()):

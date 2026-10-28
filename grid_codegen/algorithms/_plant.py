@@ -1998,10 +1998,11 @@ def gen_plant_step_kernel(self):
 
 
 def _plant_step_gradient_extra_t_buffers(self):
-    """The plant_step_gradient kernel's shared-arena T-slot list (PERF/full-smem
-    shape; every band in smem). Single source of truth shared by
-    gen_plant_step_gradient_kernel and the plant_step_gradient_arena carve
-    struct so the two cannot drift."""
+    """Full shared scratch for callers of plant_step_gradient_device.
+
+    This describes the caller-placed arena exposed by the carve struct. The
+    tiered kernel independently uses the integrator-gradient arena descriptor.
+    """
     n = self.robot.get_num_vel()
     fb = 1 if self.robot.floating_base else 0
     nx = self.robot.get_num_pos() + self.robot.get_num_vel()
@@ -2029,9 +2030,9 @@ def _plant_step_gradient_extra_t_buffers(self):
 
 def gen_plant_step_gradient_arena_carve_struct(self):
     """Emit the namespace-scope `plant_step_gradient_arena<T>` carve struct
-    (GATO ASK6): the full-smem sub-buffer layout plant_step_gradient_kernel
-    carves — the struct's members ARE plant_step_gradient's caller-placed
-    buffer arguments, so an external kernel can allocate
+    (GATO ASK6): full shared scratch for the caller-placed plant_step_gradient
+    device surface. Its members are that function's buffer arguments, so an
+    external kernel can allocate
     grid::INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T, TIER_SHARED>() bytes (the
     same reservation the kernel launches with), carve(), and forward. No exact
     t-count tie exists for this surface (it reserves the du sizer, which may be
@@ -2056,92 +2057,94 @@ def gen_plant_step_gradient_arena_carve_struct(self):
 
 
 def gen_plant_step_gradient_kernel(self):
-    """`plant_step_gradient_kernel` — one block/timestep [A|B] = s_dAB.
+    """Emit the plant Jacobian with the integrator-gradient resource ladder.
 
-    plant_step_gradient is an inner-owns-placement orchestrator (it forwards to
-    grid::integrator_gradient_device, which OWNS its FD-grad s_temp pool
-    placement). The kernel therefore sets up the WHOLE scratch arena in shared
-    memory itself — mirroring grid::integrator_gradient_kernel's PERF/full-smem
-    body (every band in smem: SCRATCH_IN_SMEM=true, no workspace/spill) — then
-    calls grid_plant::plant_step_gradient (the thin pass-through). The emitted
-    s_dAB is byte-identical to grid::integrator_gradient's. Inputs/outputs are
-    global; the launch reserves grid::INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES.
+    Inputs retain the plant [q; qd], u layout; the device call, scratch bands,
+    and per-tier placements match integrator_gradient_kernel. A caller supplies
+    the usual per-block grid workspace when its selected rung spills.
+    """
+    from ._integrator_gradient import _integrator_du_extra_t_buffers
+    from grid_codegen.helpers._code_generation_helpers import gen_workspace_cast_expr
 
-    x = [q (NUM_POS); qd (NUM_VEL)] (NON-const: the multi-stage RK path mutates
-    q/qd across stages in smem); u = control torque (NUM_VEL)."""
     n = self.robot.get_num_vel()
-    fb = 1 if self.robot.floating_base else 0
-    nx = self.robot.get_num_pos() + self.robot.get_num_vel()
-    from ._integrator import _max_stages_in_use
-    max_stages = _max_stages_in_use()
-    d_qdd_count = max_stages * n * 3 * n
-    inner_temp_full = self.gen_integrator_gradient_inner_temp_mem_size()
-    # s_vaf is body-indexed (NB bodies, stride 6); size by NB for mimic robots
-    # (NB>nv) so the composed FD-grad ID sub-inner's 18*NB writes don't overflow
-    # the adjacent buffers (mirrors integrator_gradient_kernel's vaf sizing).
-    vaf_cnt = 18 * (self.robot.get_num_joints() if self.robot_has_mimic_joints() else n)
-    self.gen_add_func_doc("plant_step_gradient kernel: [A|B] = integrator_gradient([q;qd], u, dt) per timestep "
-                          "(full-smem scratch arena; pass-through to grid::integrator_gradient_device)",
-                          [],
-                          ["d_dAB is the [A|B] output (2*NUM_VEL*3*NUM_VEL per timestep, column-major)",
-                           "d_x is the packed current state [q; qd] (NUM_POS+NUM_VEL per timestep)",
-                           "d_u is the packed control torque (NUM_VEL per timestep)",
-                           "stride_x / stride_u are the per-timestep strides",
-                           "d_robotModel / gravity / dt as for plant_step",
-                           "NUM_TIMESTEPS is the batch size"], None)
-    # MUJOCO_OUTPUT (floating only): LAST template param so existing <T, IT> call
-    # sites are unaffected; default false -> byte-identical pin codegen. Threaded to
-    # the input convert + forwarded to plant_step_gradient (whose dAB epilogue is the
-    # validated grid::integrator_gradient_device mjx transform).
-    mjx_kernel = self.robot.floating_base
-    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false>")
+    nq = self.robot.get_num_pos()
+    nx = nq + n
+    fb = self.robot.floating_base
+    inner_full = self.gen_integrator_gradient_inner_temp_mem_size()
+    inner_selective = (inner_full if self.robot_has_mimic_joints()
+                       else max(self.gen_minv_inner_temp_mem_size(),
+                                self.gen_inverse_dynamics_gradient_temp_layout()["selective_shared_count"]))
+    self.gen_add_func_doc(
+        "Plant step gradient [A|B], using the integrator-gradient resource tiers",
+        [], ["d_x is packed [q; qd], d_u is the control input",
+             "d_dAB is column-major 2*NUM_VEL by 3*NUM_VEL per timestep",
+             "Reserve INTEGRATOR_DU_DYNAMIC_SHARED_MEM_BYTES<T, RESOURCE_TIER>() shared bytes",
+             "d_workspace is the gridData per-block scratch (required by spilled tiers)"], None)
+    # Keep the existing MUJOCO_OUTPUT slot; the new tier and workspace are additive.
+    self.gen_add_code_line("template <typename T, grid::IntegratorType IT = grid::IntegratorType::EULER, bool MUJOCO_OUTPUT = false, int RESOURCE_TIER = grid::GRID_DEFAULT_RESOURCE_TIER>")
     self.gen_add_code_line("__global__")
     self.gen_add_code_line("__launch_bounds__(grid::MAX_PERF_LEVEL_THREADS)")
     self.gen_add_code_line("void plant_step_gradient_kernel(T *d_dAB, const T *d_x, const T *d_u, "
                            "const int stride_x, const int stride_u, "
-                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, const int NUM_TIMESTEPS) {", True)
-    # The shared-arena machinery (grid_align_up / grid_arena_ptr / the *_BYTES
-    # helpers) + IntegratorType / robotModel live in `namespace grid`; this
-    # kernel is in the sibling `grid_plant`, so pull them into scope. The only
-    # grid_plant symbol the body references (plant_step_gradient) is found by
-    # enclosing-namespace lookup.
+                           "const grid::robotModel<T> *d_robotModel, const T gravity, const T dt, "
+                           "const int NUM_TIMESTEPS, unsigned char *d_workspace = nullptr) {", True)
     self.gen_add_code_line("using namespace grid;")
-    # Whole scratch arena in shared memory (PERF/full-smem; mirrors the
-    # integrator_gradient_kernel _emit_body(dqdd_in_smem=True, dab_in_smem=True,
-    # inner_level=0) layout). s_x (= s_q;s_qd) + s_u are staged from global; the
-    # FD-grad bands, the dAB output, and the multi-stage scratch all live here.
-    extra_t_buffers = _plant_step_gradient_extra_t_buffers(self)
-    self.gen_XImats_helpers_temp_shared_memory_code(
-        inner_temp_full, extra_t_buffers=extra_t_buffers)
-    self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
-    # stage x (q;qd) + u into smem (plant_step_gradient mutates q/qd across stages).
-    self.gen_add_parallel_loop("ind", str(nx))
-    self.gen_add_code_line("s_x[ind] = d_x[k*stride_x + ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_parallel_loop("ind", str(n))
-    self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    # mjx input convert (GRADIENT family): quat wxyz->xyzw + base-linear velocity +
-    # force -> pin frame, in place on the staged s_x/s_u, BEFORE the device call (so
-    # the RBD callees + the dAB epilogue see pin quantities). No-op on the pin path.
-    if mjx_kernel:
-        _gen_plant_step_gradient_mjx_kernel_input(self)
-    # All scratch is smem (SCRATCH_IN_SMEM=true, no spill): pass nullptr for the
-    # global workspace + spill regions. The orchestrator owns its s_temp pool.
-    mjx_flag = ", MUJOCO_OUTPUT" if mjx_kernel else ""
-    self.gen_add_code_line("plant_step_gradient<T, IT, true, false" + mjx_flag + ">("
-                           "s_dAB, s_x, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
-                           "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
-                           "s_dInt_q_6x6, s_dInt_v_6x6, "
-                           + self.gen_insert_helpers_function_call()
-                           + "s_temp, nullptr, nullptr, d_robotModel, gravity, dt);")
-    self.gen_add_sync()
-    self.gen_add_serial_ops()
-    self.gen_add_code_line("for (int ind = 0; ind < " + str(2 * n * 3 * n) + "; ++ind) d_dAB[k*" + str(2 * n * 3 * n) + " + ind] = s_dAB[ind];")
-    self.gen_add_end_control_flow()
-    self.gen_add_sync()
-    self.gen_add_end_control_flow()
+
+    def emit_body(dqdd_in_smem, dab_in_smem, inner_level):
+        inner_count = (inner_full if inner_level == 0 else inner_selective if inner_level == 1 else 0)
+        # Reuse the integrator's layout, including spherical-joint scratch sizing.
+        extra = _integrator_du_extra_t_buffers(self, nq, n, fb,
+                                               dqdd_in_smem, dab_in_smem, False)
+        self.gen_XImats_helpers_temp_shared_memory_code(inner_count, extra_t_buffers=extra)
+        self.gen_add_code_line("T *s_x = s_q_qd_u; T *s_u = &s_q_qd_u[" + str(2*nq) + "];")
+        self.gen_add_parallel_loop("k", "NUM_TIMESTEPS", block_level=True)
+        self.gen_add_parallel_loop("ind", str(nx))
+        self.gen_add_code_line("s_x[ind] = d_x[k*stride_x + ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_parallel_loop("ind", str(n))
+        self.gen_add_code_line("s_u[ind] = d_u[k*stride_u + ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        if fb:
+            _gen_plant_step_gradient_mjx_kernel_input(self)
+        # Every live block owns one slot, even when it grid-strides over a batch.
+        if not dqdd_in_smem:
+            self.gen_add_code_line("T *s_D_qdd_stage = " + gen_workspace_cast_expr(batch_indexed=True) + ";")
+        if not dab_in_smem:
+            self.gen_add_code_line("T *s_dAB = " + gen_workspace_cast_expr(
+                "GRID_INTEGRATOR_GRADIENT_DAB_OFFSET_BYTES<T>()", batch_indexed=True) + ";")
+        pool = (gen_workspace_cast_expr("GRID_INTEGRATOR_GRADIENT_INNER_OFFSET_BYTES<T>()", batch_indexed=True)
+                if inner_level == 2 else "nullptr")
+        spill = (gen_workspace_cast_expr("GRID_INTEGRATOR_GRADIENT_INNER_OFFSET_BYTES<T>()", batch_indexed=True)
+                 if inner_level == 1 else "nullptr")
+        flags = ("false" if inner_level == 2 else "true") + ", " + ("true" if inner_level == 1 else "false")
+        if fb:
+            flags += ", MUJOCO_OUTPUT"
+        self.gen_add_code_line("plant_step_gradient<T, IT, " + flags + ">("
+                               "s_dAB, s_x, s_u, s_df_du, s_dc_du, s_vaf, s_Minv, s_qdd, "
+                               "s_q_orig, s_qd_orig, s_stage_grad_qdd, s_D_qdd_stage, "
+                               "s_dInt_q_6x6, s_dInt_v_6x6, "
+                               + self.gen_insert_helpers_function_call()
+                               + "s_temp, " + pool + ", " + spill + ", d_robotModel, gravity, dt);")
+        self.gen_add_sync()
+        self.gen_add_parallel_loop("ind", str(2*n*3*n))
+        self.gen_add_code_line("d_dAB[k*" + str(2*n*3*n) + " + ind] = s_dAB[ind];")
+        self.gen_add_end_control_flow()
+        self.gen_add_sync()
+        self.gen_add_end_control_flow()
+
+    picks = self.integrator_gradient_spill_tier_3way
+    dqdd = self.integrator_gradient_dqdd_in_smem_per_tier
+    dab = self.integrator_gradient_dab_in_smem_per_tier
+    levels = self.integrator_gradient_inner_level_per_tier
+    if picks[0] == picks[1] == picks[2]:
+        emit_body(dqdd[0], dab[0], levels[0])
+    else:
+        for index, tier in enumerate(("TIER_SHARED", "TIER_LITE", "TIER_MINIMAL")):
+            self.gen_add_code_line(("if" if index == 0 else "else if") +
+                                   " constexpr (RESOURCE_TIER == " + tier + ") {", True)
+            emit_body(dqdd[index], dab[index], levels[index])
+            self.gen_add_end_control_flow()
     self.gen_add_end_function()
 
 

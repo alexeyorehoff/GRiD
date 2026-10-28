@@ -13,6 +13,7 @@ registration after everyone closed re-initializes cleanly.
 from __future__ import annotations
 
 import shutil
+import os
 import sys
 from pathlib import Path
 
@@ -78,6 +79,31 @@ def test_reverse_close_order_and_gc():
     del a; gc.collect()
     np.testing.assert_allclose(_tau(b, q, qd), ref)
     b.close()
+
+
+def test_force_rebuild_preserves_an_already_loaded_runtime():
+    a = _register("w04_force_live_a")
+    b = None
+    try:
+        q = np.full((2, a.num_joints), .2, np.float32)
+        qd = np.zeros_like(q)
+        baked = _tau(a, q, qd)
+        params = np.array(a.inertia_params, dtype=np.float64)
+        params[:, 0] *= 2.0
+        a.set_inertia_params(params)
+        updated = _tau(a, q, qd)
+        assert np.abs(updated - baked).max() > 1e-3
+        b = grid_rbd.register_robot("w04_force_live_b", str(_IIWA), force_rebuild=True, **_KW)
+        if os.name == "nt":
+            assert b._so_path != a._so_path, "Windows needs a fresh DLL image for a forced build"
+        np.testing.assert_allclose(_tau(a, q, qd), updated)
+        expected = baked if b._so_path != a._so_path else updated
+        np.testing.assert_allclose(_tau(b, q, qd), expected)
+        assert Path(a._so_path).is_file(), "the original loaded library must survive"
+    finally:
+        if b is not None:
+            b.close()
+        a.close()
 
 
 @pytest.mark.parametrize("backend", ["torch", "jax"])

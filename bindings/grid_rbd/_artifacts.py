@@ -25,7 +25,7 @@ artifact itself (dlopen, ctypes, its own binding); GRiD never binds the consumer
 from __future__ import annotations
 
 import concurrent.futures
-import fcntl
+from grid_codegen import _filelock as fcntl
 import hashlib
 import json
 import logging
@@ -44,7 +44,7 @@ from ._cache import (_KEY_SCHEMA, _arch_loadable, _sweep_dead_staging_dirs, cano
                      default_cache_dir, detect_cuda_arch, effective_cuda_archs, keymap_lookup,
                      keymap_record, package_version, read_build_inputs, stale_hit_reasons,
                      write_build_inputs)
-from ._compile import _NVCC_DEFAULT_FLAGS, _build_jobs, find_nvcc, generate_grid_cuh
+from ._compile import _NVCC_DEFAULT_FLAGS, _build_jobs, _windows_export_flags, find_nvcc, generate_grid_cuh
 
 _log = logging.getLogger("grid_rbd")
 
@@ -345,7 +345,7 @@ def _build(gen_dir: Path, sources: list[Path], headers: list[Path], compile_cmd:
     object_cache_dir.mkdir(parents=True, exist_ok=True)
     log_path = gen_dir / "build.log"
     lock = threading.Lock()
-    with log_path.open("w") as log:
+    with log_path.open("w", encoding="utf-8") as log:
         log.write("$ " + " ".join(compile_cmd) + " -c <unit> -o <unit>.o   # x" + str(len(sources)) + "\n")
         log.write("$ " + " ".join([nvcc, "--shared", "-o", str(out_so), "<units>.o"] + link_flags) + "\n\n")
     record: dict[str, Any] = {"units": {}}
@@ -355,17 +355,17 @@ def _build(gen_dir: Path, sources: list[Path], headers: list[Path], compile_cmd:
         cached = object_cache_dir / f"{unit.stem}-{key}.o"
         if reuse_objects and cached.is_file():
             os.utime(cached)
-            with lock, log_path.open("a") as log:
+            with lock, log_path.open("a", encoding="utf-8") as log:
                 log.write(f"[{unit.stem}] cached {cached.name}\n")
             record["units"][unit.name] = {"object": cached.name, "compiled": False}
             return cached, 0, 0.0, ""
         obj = build_dir / (unit.stem + ".o")
         ulog = build_dir / (unit.stem + ".log")
         t0 = time.monotonic()
-        with ulog.open("w") as f:
+        with ulog.open("w", encoding="utf-8") as f:
             r = subprocess.run(compile_cmd + ["-c", str(unit), "-o", str(obj)], stdout=f, stderr=subprocess.STDOUT)
         secs = time.monotonic() - t0
-        with lock, log_path.open("a") as log:
+        with lock, log_path.open("a", encoding="utf-8") as log:
             log.write(f"[{unit.stem}] rc={r.returncode} {secs:.1f}s\n")
         if r.returncode == 0:
             tmp = cached.with_name(cached.name + f".{os.getpid()}.tmp")
@@ -373,7 +373,7 @@ def _build(gen_dir: Path, sources: list[Path], headers: list[Path], compile_cmd:
             os.replace(tmp, cached)
             obj = cached
             record["units"][unit.name] = {"object": cached.name, "compiled": True, "seconds": round(secs, 1)}
-        return obj, r.returncode, secs, ulog.read_text()
+        return obj, r.returncode, secs, ulog.read_text(encoding="utf-8")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(one, sources))
@@ -383,14 +383,16 @@ def _build(gen_dir: Path, sources: list[Path], headers: list[Path], compile_cmd:
         raise RuntimeError(f"nvcc exit {rc} compiling the consumer unit {obj.stem}:\n{out}")
     objs = [str(obj) for obj, _, _, _ in results]
     link = [nvcc, "--shared", "-o", str(out_so)] + objs + link_flags
+    if os.name == "nt":
+        link.extend(["-Xcompiler=/MD", *_windows_export_flags(objs, prefixes=None)])
     t0 = time.monotonic()
-    with log_path.open("a") as log:
+    with log_path.open("a", encoding="utf-8") as log:
         log.write("\n$ " + " ".join(link) + "\n")
         log.flush()
         r = subprocess.run(link, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"[link] rc={r.returncode} {time.monotonic() - t0:.1f}s\n")
     if r.returncode != 0:
-        raise RuntimeError(f"nvcc exit {r.returncode} linking the consumer artifact; build log:\n" + log_path.read_text())
+        raise RuntimeError(f"nvcc exit {r.returncode} linking the consumer artifact; build log:\n" + log_path.read_text(encoding="utf-8"))
     shutil.rmtree(build_dir, ignore_errors=True)
     record["compiled_units"] = sum(1 for _, _, secs, _ in results if secs > 0)
     return record
@@ -405,7 +407,7 @@ def _load_manifest(root: Path) -> dict[str, Any]:
     path = _manifest_path(root)
     if not path.exists():
         return {"artifact_schema": ARTIFACT_SCHEMA, "artifacts": {}}
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("artifact_schema") != ARTIFACT_SCHEMA:
         raise ConsumerArtifactError(
             f"{path} was written with artifact schema {data.get('artifact_schema')!r}; this grid_rbd expects "
@@ -415,13 +417,13 @@ def _load_manifest(root: Path) -> dict[str, Any]:
 
 def _manifest_register(root: Path, name: str, content_key: str, meta: dict[str, Any]) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    with (root / "manifest.lock").open("a+") as lock:
+    with (root / "manifest.lock").open("a+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
             manifest = _load_manifest(root)
             manifest["artifacts"][name] = {"content_key": content_key, **meta}
             tmp = _manifest_path(root).with_suffix(f".json.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+            tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
             tmp.replace(_manifest_path(root))
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -542,7 +544,7 @@ def build_artifact(consumer: str, name: str, urdf_path: str | Path, *,
             entry_dir = store / mapped
             stale = _entry_state(entry_dir)
             if not stale:
-                meta = json.loads((entry_dir / "meta.json").read_text())
+                meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
                 _manifest_register(root, name, mapped, meta)
                 return ConsumerArtifact(consumer, name, entry_dir / artifact_name, entry_dir / "grid.cuh",
                                         entry_dir, mapped, input_key, cuda_arch, meta, False)
@@ -560,7 +562,7 @@ def build_artifact(consumer: str, name: str, urdf_path: str | Path, *,
         content_key = _content_key(gen_dir, srcs, hdrs, compile_cmd, lflags, artifact_name)
         entry_dir = store / content_key
         if (entry_dir / artifact_name).exists() and (entry_dir / "meta.json").exists() and not force_rebuild:
-            meta = json.loads((entry_dir / "meta.json").read_text())
+            meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
             if read_build_inputs(entry_dir) is None:
                 write_build_inputs(entry_dir, identity)
         else:
@@ -583,14 +585,14 @@ def build_artifact(consumer: str, name: str, urdf_path: str | Path, *,
             archs = effective_cuda_archs(cuda_arch)
             if archs is not None:
                 meta["cuda_archs"] = archs
-            (gen_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
+            (gen_dir / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
             write_build_inputs(gen_dir, identity)
             if force_rebuild and entry_dir.exists():
                 shutil.rmtree(entry_dir)
             try:
                 os.replace(gen_dir, entry_dir)
             except OSError:
-                meta = json.loads((entry_dir / "meta.json").read_text())
+                meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
     finally:
         shutil.rmtree(gen_dir, ignore_errors=True)
     keymap_record(root, input_key, content_key)
@@ -629,7 +631,7 @@ def load_artifact(consumer: str, name: str, cache_dir: str | Path | None = None,
         reasons.append(f"cuda_arch: recorded {recorded.get('cuda_arch')!r} (archs {recorded.get('cuda_archs')!r}) != current {cuda_arch!r}")
     if reasons:
         raise ArtifactIncompatibleError(f"artifact {name!r} of {consumer!r} cannot be loaded here: " + "; ".join(reasons))
-    meta = json.loads((entry_dir / "meta.json").read_text())
+    meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
     return ConsumerArtifact(consumer, name, entry_dir / artifact_name, entry_dir / "grid.cuh", entry_dir,
                             entry["content_key"], None, int(recorded.get("cuda_arch", cuda_arch or 0)), meta, False)
 

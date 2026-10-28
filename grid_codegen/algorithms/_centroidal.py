@@ -312,6 +312,19 @@ def gen_centroidal_inner(self):
     n_bfs_levels = self.robot.get_max_bfs_level() + 1
     ImatOffset = 36 * NB  # body inertias start here in d_XImats
 
+    # Device wrappers own their scratch only; kernel byte counts also include
+    # packed inputs/outputs and must not be used to size an enclosing kernel.
+    device_layout = self._resolve_arena_layout(
+        _centroidal_device_extra(self) + [("s_XmatsHom", self.gen_get_Xhom_size()[0])],
+        _centroidal_inner_temp_mem_size(self, j_in_smem=False), include_topology_helpers=True, ximat_size=0)
+    device_t_count = sum(count for _, count in device_layout.t_buffers) + device_layout.temp_mem_size
+    device_j_count = 6 * nv * NB
+    self.gen_add_code_lines([
+        "template <typename T, bool J_IN_SMEM = true> __host__ __device__ constexpr size_t CENTROIDAL_DEVICE_SHARED_MEM_BYTES() {",
+        f"    return grid_shared_arena_bytes<T>({device_t_count} + (J_IN_SMEM ? {device_j_count} : 0), {device_layout.topology_count});",
+        "}",
+    ])
+
     func_params = [
         "s_A is the output 6 x NUM_VEL CMM (column-major, [linear; angular] @ CoM, world-aligned)",
         "s_com is the output 3-vector world CoM",
@@ -563,6 +576,16 @@ def _centroidal_device_extra(self):
     return [("s_A", 6 * nv), ("s_com", 3), ("s_extra", 4)]
 
 
+def _gen_centroidal_device_arena(self):
+    """Keep the body Jacobians in shared memory or in caller-owned workspace."""
+    size = 6 * self.robot.get_num_vel() * self.robot.get_num_bodies()
+    self.gen_add_code_line(f"constexpr int s_J_slot = J_IN_SMEM ? {size} : 0;")
+    extra = _centroidal_device_extra(self) + [("s_J", "s_J_slot")]
+    self.gen_XmatsHom_helpers_temp_shared_memory_code(
+        _centroidal_inner_temp_mem_size(self, j_in_smem=False), extra_t_buffers=extra)
+    self.gen_add_code_line("if constexpr (!J_IN_SMEM) { s_J = d_J_workspace; }")
+
+
 def _gen_centroidal_call(self, spill=False):
     if spill:
         # kernel path (DE-GATE #2): s_J is carved as a SEPARATE tier-routed buffer
@@ -579,18 +602,17 @@ def _gen_centroidal_call(self, spill=False):
 
 def gen_com_device(self):
     nv = self.robot.get_num_vel()
-    func_def = ("void com_device(T *s_out, const T *s_q, const robotModel<T> *d_robotModel) {")
+    func_def = ("void com_device(T *s_out, const T *s_q, const robotModel<T> *d_robotModel, T *d_J_workspace = nullptr) {")
     func_params = ["s_out holds [p_com (3); J_com (3 x NUM_VEL, column-major)]",
-                   "s_q is the joint position vector", "d_robotModel is the GPU model helpers"]
+                   "s_q is the joint position vector", "d_robotModel is the GPU model helpers",
+                   "d_J_workspace is 6*NUM_VEL*NUM_BODIES caller-owned T elements when J_IN_SMEM=false"]
     self.gen_add_func_doc("Compute CoM position and CoM Jacobian", [], func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool J_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    extra = _centroidal_device_extra(self)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(
-        _centroidal_inner_temp_mem_size(self), extra_t_buffers=extra)
+    _gen_centroidal_device_arena(self)
     self.gen_load_update_XmatsHom_helpers_function_call()
-    _gen_centroidal_call(self)
+    _gen_centroidal_call(self, spill=True)
     self.gen_add_sync()
     # write s_out: [com(3); Jcom (3 x nv)] ; Jcom = A[:3,:] / mass
     self.gen_add_serial_ops()
@@ -606,18 +628,17 @@ def gen_com_device(self):
 
 def gen_ccrba_device(self):
     nv = self.robot.get_num_vel()
-    func_def = ("void ccrba_device(T *s_out, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel) {")
+    func_def = ("void ccrba_device(T *s_out, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel, T *d_J_workspace = nullptr) {")
     func_params = ["s_out holds [A (6 x NUM_VEL, column-major); h (6)]",
-                   "s_q / s_qd are joint position / velocity", "d_robotModel is the GPU model helpers"]
+                   "s_q / s_qd are joint position / velocity", "d_robotModel is the GPU model helpers",
+                   "d_J_workspace is 6*NUM_VEL*NUM_BODIES caller-owned T elements when J_IN_SMEM=false"]
     self.gen_add_func_doc("Compute the centroidal momentum matrix A and momentum h = A qd", [], func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool J_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    extra = _centroidal_device_extra(self)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(
-        _centroidal_inner_temp_mem_size(self), extra_t_buffers=extra)
+    _gen_centroidal_device_arena(self)
     self.gen_load_update_XmatsHom_helpers_function_call()
-    _gen_centroidal_call(self)
+    _gen_centroidal_call(self, spill=True)
     self.gen_add_sync()
     # write A then h = A qd
     self.gen_add_parallel_loop("ind", str(6 * nv))
@@ -635,27 +656,25 @@ def gen_ccrba_device(self):
 
 def gen_energy_device(self):
     nv = self.robot.get_num_vel()
-    func_def = ("void energy_device(T *s_out, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel, const T gravity) {")
+    func_def = ("void energy_device(T *s_out, const T *s_q, const T *s_qd, const robotModel<T> *d_robotModel, const T gravity, T *d_J_workspace = nullptr) {")
     func_params = ["s_out holds [KE, PE, mechanical]",
                    "s_q / s_qd are joint position / velocity", "d_robotModel is the GPU model helpers",
-                   "gravity is the gravity constant"]
+                   "gravity is the gravity constant",
+                   "d_J_workspace is 6*NUM_VEL*NUM_BODIES caller-owned T elements when J_IN_SMEM=false"]
     self.gen_add_func_doc("Compute kinetic / potential / mechanical energy", [], func_params, None)
-    self.gen_add_code_line("template <typename T>")
+    self.gen_add_code_line("template <typename T, bool J_IN_SMEM = true>")
     self.gen_add_code_line("__device__")
     self.gen_add_code_line(func_def, True)
-    extra = _centroidal_device_extra(self)
-    self.gen_XmatsHom_helpers_temp_shared_memory_code(
-        _centroidal_inner_temp_mem_size(self), extra_t_buffers=extra)
+    _gen_centroidal_device_arena(self)
     self.gen_load_update_XmatsHom_helpers_function_call()
-    _gen_centroidal_call(self)
+    _gen_centroidal_call(self, spill=True)
     self.gen_add_sync()
     # KE = 1/2 sum_j (J_j qd)^T Iw_j (J_j qd). Recompute via the per-body world
     # inertias + Jacobians left in s_temp by the inner.
     NB = self.robot.get_num_bodies()
-    off_J = 16 * self.robot.get_num_joints()
-    off_Iw = off_J + 6 * nv * NB
+    off_Iw = 16 * self.robot.get_num_joints()
     self.gen_add_serial_ops()
-    self.gen_add_code_line("T *cJ  = &s_temp[" + str(off_J) + "];")
+    self.gen_add_code_line("T *cJ = s_J;")
     self.gen_add_code_line("T *cIw = &s_temp[" + str(off_Iw) + "];")
     self.gen_add_code_line("T ke = static_cast<T>(0);")
     self.gen_add_code_line("for (int jid = 0; jid < " + str(NB) + "; ++jid) {", True)

@@ -18,10 +18,8 @@ _grid_rbd = pytest.importorskip("grid_rbd", reason="grid-rbd not installed")
 _jax = pytest.importorskip("jax", reason="jax not installed")
 _torch = pytest.importorskip("torch", reason="torch not installed")
 
-_URDF = (
-    Path.home()
-    / ".cache/robot_descriptions/drake/manipulation/models/iiwa_description/urdf/iiwa14_primitive_collision.urdf"
-)
+from grid_assets import robot_urdf
+_URDF = robot_urdf("iiwa14")
 if not _URDF.exists():
     pytest.skip(f"iiwa14 URDF fixture not present at {_URDF}", allow_module_level=True)
 if shutil.which("nvcc") is None:

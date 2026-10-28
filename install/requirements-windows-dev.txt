@@ -1,0 +1,11 @@
+pytest>=7
+setuptools>=77
+pybind11>=2.11
+pytest-gpu-proof==0.4.1
+nbval
+pyyaml
+matplotlib
+psutil
+pywin32
+robot_descriptions>=1.23.0
+xacrodoc

@@ -40,22 +40,18 @@ __device__ T d_eps;
 
 // value + both Jacobians at q0, plus the world transforms so the host can independently recompute.
 __global__ void analytic_kernel(const T *q0, const T *fc, const grid::robotModel<T> *m,
-                                T *d_fext, T *d_dfc, T *d_dq, T *d_dtau, T *d_Xw) {
-    __shared__ T s_fext[NR], s_dfc[NR*NFC], s_dq[NR*NV];
-    __shared__ T s_dtau[NV*6*NB], s_dqdd[NV*6*NB];
+                                T *d_fext, T *d_dfc, T *d_dq, T *d_dtau, T *d_Xw,
+                                T *d_dqdd) {
+    // Caller-owned outputs also serve as intermediate device workspace. Keeping
+    // another 49 KiB copy in shared memory prevents this fp64 test from fitting
+    // beside the analytic routines' scratch on a 64-KiB GPU.
     // -J^T (its columns ARE the local body Jacobian -> the omega the dq map needs)
-    grid::f_ext_gradient_device<T>(s_dtau, s_dqdd, q0, m);
+    grid::f_ext_gradient_device<T>(d_dtau, d_dqdd, q0, m);
     __syncthreads();
-    grid::f_ext_body_device<T>(s_fext, fc, q0, m);
-    grid::f_ext_body_jacobian_dfc_device<T>(s_dfc, q0, m);
-    grid::f_ext_body_jacobian_dq_device<T>(s_dq, fc, s_dtau, q0, m);
+    grid::f_ext_body_device<T>(d_fext, fc, q0, m);
+    grid::f_ext_body_jacobian_dfc_device<T>(d_dfc, q0, m);
+    grid::f_ext_body_jacobian_dq_device<T>(d_dq, fc, d_dtau, q0, m);
     __syncthreads();
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        for (int i = 0; i < NR; ++i)      d_fext[i] = s_fext[i];
-        for (int i = 0; i < NR*NFC; ++i)  d_dfc[i]  = s_dfc[i];
-        for (int i = 0; i < NR*NV; ++i)   d_dq[i]   = s_dq[i];
-        for (int i = 0; i < NV*6*NB; ++i) d_dtau[i] = s_dtau[i];
-    }
 }
 
 // f_ext value at a perturbed state. `mode`: 0 = perturb f_c[idx], 1 = SE(3)-retract q along dv[idx].
@@ -90,8 +86,8 @@ int main(){
     size_t s2 = grid::END_EFFECTOR_POSE_DYNAMIC_SHARED_MEM_BYTES<T>();
     if (s2 > smem) smem = s2;
     smem += 4096;
-    cudaFuncSetAttribute(analytic_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    cudaFuncSetAttribute(fd_kernel,       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    CK(cudaFuncSetAttribute(analytic_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    CK(cudaFuncSetAttribute(fd_kernel,       cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
 
     // q0: a non-trivial floating-base configuration (unit quaternion, bent legs).
     std::vector<T> hq(NQ, 0.0);
@@ -110,14 +106,16 @@ int main(){
     T eps = 1e-6;
     CK(cudaMemcpyToSymbol(d_eps, &eps, sizeof(T)));
 
-    T *d_q,*d_fc,*d_fext,*d_dfc,*d_dq,*d_dtau,*d_Xw,*d_tmp;
+    T *d_q,*d_fc,*d_fext,*d_dfc,*d_dq,*d_dtau,*d_Xw,*d_tmp,*d_dqdd;
     CK(cudaMalloc(&d_q, NQ*sizeof(T)));      CK(cudaMemcpy(d_q,hq.data(),NQ*sizeof(T),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_fc, NFC*sizeof(T)));    CK(cudaMemcpy(d_fc,hfc.data(),NFC*sizeof(T),cudaMemcpyHostToDevice));
     CK(cudaMalloc(&d_fext, NR*sizeof(T)));   CK(cudaMalloc(&d_dfc, (size_t)NR*NFC*sizeof(T)));
     CK(cudaMalloc(&d_dq, (size_t)NR*NV*sizeof(T))); CK(cudaMalloc(&d_dtau, (size_t)NV*6*NB*sizeof(T)));
     CK(cudaMalloc(&d_Xw, 16*grid::NUM_JOINTS*sizeof(T))); CK(cudaMalloc(&d_tmp, NR*sizeof(T)));
+    CK(cudaMalloc(&d_dqdd, (size_t)NV*6*NB*sizeof(T)));
 
-    analytic_kernel<<<1,128,smem>>>(d_q,d_fc,m,d_fext,d_dfc,d_dq,d_dtau,d_Xw); CK(cudaDeviceSynchronize());
+    analytic_kernel<<<1,128,smem>>>(d_q,d_fc,m,d_fext,d_dfc,d_dq,d_dtau,d_Xw,d_dqdd);
+    CK(cudaPeekAtLastError()); CK(cudaDeviceSynchronize());
     std::vector<T> fext(NR), dfc((size_t)NR*NFC), dq((size_t)NR*NV);
     CK(cudaMemcpy(fext.data(), d_fext, NR*sizeof(T), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dfc.data(),  d_dfc,  (size_t)NR*NFC*sizeof(T), cudaMemcpyDeviceToHost));
@@ -162,7 +160,8 @@ int main(){
     std::vector<T> fc2(NFC); for (int i=0;i<NFC;++i) fc2[i] = 2.0*hfc[i];
     T *d_fc2; CK(cudaMalloc(&d_fc2, NFC*sizeof(T)));
     CK(cudaMemcpy(d_fc2, fc2.data(), NFC*sizeof(T), cudaMemcpyHostToDevice));
-    analytic_kernel<<<1,128,smem>>>(d_q,d_fc2,m,d_fext,d_dfc,d_dq,d_dtau,d_Xw); CK(cudaDeviceSynchronize());
+    analytic_kernel<<<1,128,smem>>>(d_q,d_fc2,m,d_fext,d_dfc,d_dq,d_dtau,d_Xw,d_dqdd);
+    CK(cudaPeekAtLastError()); CK(cudaDeviceSynchronize());
     std::vector<T> fext2(NR), dfc2((size_t)NR*NFC);
     CK(cudaMemcpy(fext2.data(), d_fext, NR*sizeof(T), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dfc2.data(),  d_dfc,  (size_t)NR*NFC*sizeof(T), cudaMemcpyDeviceToHost));

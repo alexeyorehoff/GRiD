@@ -528,10 +528,10 @@ def wrap_host_single_call_timing(func_call_code, kernel_errcheck=False):
     """Wrap the host launch-line list in the single-call timing scaffold, IN
     PLACE: clock_gettime start prepended, [optional gpuErrchkKernel,] clock_
     gettime end appended. Call only under ``if single_call_timing:``."""
-    func_call_code.insert(0, "struct timespec start, end; clock_gettime(CLOCK_MONOTONIC,&start);")
+    func_call_code.insert(0, "struct timespec start, end; grid_clock_now(&start);")
     if kernel_errcheck:
         func_call_code.append("gpuErrchkKernel();")
-    func_call_code.append("clock_gettime(CLOCK_MONOTONIC,&end);")
+    func_call_code.append("grid_clock_now(&end);")
 
 
 def gen_mjx_input_convert(self, q_name="s_q", qd_name="s_qd", qdd_name=None, u_name=None):

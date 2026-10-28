@@ -29,7 +29,13 @@
 #include <pybind11/stl.h>
 #include <optional>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -40,6 +46,48 @@
 #include <utility>
 #include <tuple>
 #include <vector>
+#include <filesystem>
+
+#ifdef _WIN32
+// Keep the C ABI cdecl, matching nvcc and ctypes.CDLL on Windows.
+static constexpr int RTLD_NOW = 0, RTLD_LOCAL = 0;
+static thread_local std::string grid_loader_error;
+static void *dlopen(const char *path, int) {
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (!count) {
+        grid_loader_error = "invalid UTF-8 library path";
+        return nullptr;
+    }
+    std::vector<wchar_t> wide(count);
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide.data(), count);
+    // DLL_LOAD_DIR requires an absolute path, including for a caller that
+    // supplies a relative library filename. Keep the conversion Unicode-safe.
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(std::filesystem::path(wide.data()), error);
+    if (error) {
+        grid_loader_error = "cannot resolve library path: " + error.message();
+        return nullptr;
+    }
+    HMODULE handle = LoadLibraryExW(absolute.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!handle) grid_loader_error = "LoadLibraryExW error " + std::to_string(GetLastError());
+    return reinterpret_cast<void *>(handle);
+}
+static void *dlsym(void *handle, const char *name) {
+    auto symbol = GetProcAddress(reinterpret_cast<HMODULE>(handle), name);
+    if (!symbol) grid_loader_error = "GetProcAddress error " + std::to_string(GetLastError());
+    return reinterpret_cast<void *>(symbol);
+}
+static const char *dlerror() {
+    static thread_local std::string returned_error;
+    returned_error.swap(grid_loader_error);
+    grid_loader_error.clear();
+    return returned_error.empty() ? nullptr : returned_error.c_str();
+}
+static int dlclose(void *handle) {
+    return FreeLibrary(reinterpret_cast<HMODULE>(handle)) ? 0 : -1;
+}
+#endif
 
 // ── allocate-once host round trip (2026-10-01) ────────────────────────────────
 // Generated methods flagged py_out_param in abi_specs take an optional caller-
@@ -410,9 +458,9 @@ public:
         static std::unordered_map<std::string, RuntimeOwner> m; return m;
     }
     static std::string canonical_path(const std::string& p) {
-        char buf[PATH_MAX];
-        const char* r = ::realpath(p.c_str(), buf);
-        return r ? std::string(r) : p;
+        std::error_code error;
+        auto resolved = std::filesystem::canonical(std::filesystem::u8path(p), error);
+        return error ? p : resolved.u8string();
     }
     void release() {
         if (!handle_) return;
@@ -631,7 +679,7 @@ public:
     // through the .so's cudaFreeHost when it is collected; the array keeps this
     // Runner — and so the dlopened .so — alive). Pass it as `out=` to the
     // py_out_param methods so the host wrapper's D2H lands in it at the PCIe rate.
-    py::array_t<CT> pinned_empty(std::vector<ssize_t> shape) {
+    py::array_t<CT> pinned_empty(std::vector<py::ssize_t> shape) {
         if (!fn_pinned_alloc_ || !fn_pinned_free_)
             throw std::runtime_error("pinned_empty: this robot .so predates the pinned-host exports; "
                                      "re-register with force_rebuild=True");

@@ -45,7 +45,9 @@ _NVCC_DEFAULT_FLAGS = [
     "-prec-div=false",
     "-prec-sqrt=false",
     # (no --shared here: units are compiled with -c and host-linked into the .so)
-    "--compiler-options=-fPIC",
+    *( ["-Xcompiler=/MD", "-Xcompiler=/utf-8", "-Xcompiler=/Zc:__cplusplus",
+        "-DNOMINMAX", "-DWIN32_LEAN_AND_MEAN"] if sys.platform == "win32"
+       else ["--compiler-options=-fPIC"] ),
     # We INTENTIONALLY do NOT set -fvisibility=hidden here — the
     # Runner dlsym's our `extern "C"` symbols, which must be exported.
 ]
@@ -487,7 +489,11 @@ def copy_wrapper_template(target_dir: Path) -> Path:
 
 
 def _jax_ffi_include_dir() -> Path | None:
-    """Return JAX's FFI header include path if jax is installed, else None."""
+    """Return CUDA JAX FFI headers on supported platforms, otherwise None."""
+    # Native Windows JAX has no NVIDIA backend. A CPU JAX installation must
+    # not enable CUDA FFI units in otherwise valid NumPy/PyTorch builds.
+    if sys.platform == "win32":
+        return None
     try:
         from jax import ffi as jax_ffi
         return Path(jax_ffi.include_dir())
@@ -534,7 +540,7 @@ def _required_cxx_std(torch_includes) -> str:
     for inc in torch_includes:
         aten = Path(inc) / "ATen" / "ATen.h"
         if aten.exists():
-            m = re.search(r"__cplusplus\s*<\s*(\d{6})L", aten.read_text(errors="ignore"))
+            m = re.search(r"__cplusplus\s*<\s*(\d{6})L", aten.read_text(errors="ignore", encoding="utf-8"))
             if m:
                 need = max(need, int(m.group(1)))
             break
@@ -562,7 +568,7 @@ def _mjx_signature_flags(cuh_path: Path) -> list[str]:
     is duplicated here, so the flags can never drift from the header
     (agent_debugging_guide §1m: dispatcher predicate must match emission gate).
     """
-    text = cuh_path.read_text()
+    text = cuh_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     # The EE launchers are renamed per-target; resolve the actual fn names from
     # the header's own #define block.
@@ -714,9 +720,12 @@ def compile_so(
             cmd.append(f"-I{inc}")
         for ld in tflags["libdirs"]:
             # -rpath must go through the linker (nvcc rejects bare -Wl,...).
-            cmd.extend([f"-L{ld}", "-Xlinker", f"-rpath,{ld}"])
+            cmd.append(f"-L{ld}")
+            if sys.platform != "win32":
+                cmd.extend(["-Xlinker", f"-rpath,{ld}"])
         cmd.extend(["-ltorch", "-ltorch_cpu", "-ltorch_cuda", "-lc10", "-lc10_cuda"])
-        cmd.append(f"-D_GLIBCXX_USE_CXX11_ABI={tflags['cxx11_abi']}")
+        if sys.platform != "win32":
+            cmd.append(f"-D_GLIBCXX_USE_CXX11_ABI={tflags['cxx11_abi']}")
         if "--expt-relaxed-constexpr" not in cmd:
             cmd.append("--expt-relaxed-constexpr")
         key = (torch_op_key or "default")
@@ -742,7 +751,21 @@ def _build_jobs() -> int:
         return max(1, int(env))
     jobs = min(8, os.cpu_count() or 1)
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong) for name in
+                    ("total_phys", "avail_phys", "total_pagefile", "avail_pagefile",
+                     "total_virtual", "avail_virtual", "avail_extended_virtual")]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                jobs = max(1, min(jobs, status.avail_phys // (3 * 1024 ** 3)))
+            return jobs
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
             if line.startswith("MemAvailable:"):
                 jobs = max(1, min(jobs, int(line.split()[1]) // (3 * 1024 * 1024)))
     except OSError:
@@ -800,6 +823,19 @@ def _unit_object_key(unit: Path, source_dir: Path, compile_cmd: list[str]) -> st
     return h.hexdigest()
 
 
+def _windows_export_flags(objects: list[str], *, prefixes=("grid_rbd_", "grid_plant_")) -> list[str]:
+    """Export only the C-ABI definitions present in the compiled COFF objects."""
+    symbols = set()
+    for obj in objects:
+        table = subprocess.check_output(["dumpbin", "/nologo", "/symbols", obj], text=True)
+        for line in table.splitlines():
+            if "UNDEF" not in line:
+                match = re.search(r"External\s+\|\s+([A-Za-z_]\w*)\s*$", line)
+                if match and (prefixes is None or match[1].startswith(prefixes)):
+                    symbols.add(match[1])
+    return [f"-Xlinker=/EXPORT:{symbol}" for symbol in sorted(symbols)]
+
+
 def _build_units(cmd: list[str], source_dir: Path, out_so: Path, arch: str,
                  core_flags: list[str] | None = None,
                  object_cache_dir: Path | None = None,
@@ -847,7 +883,7 @@ def _build_units(cmd: list[str], source_dir: Path, out_so: Path, arch: str,
     lock = threading.Lock()
     _log.info("grid_rbd: compiling %s for %s (%d units, %d parallel; nvcc, may take "
               "seconds–minutes) — log: %s", out_so.name, arch, len(units), jobs, log_path)
-    with log_path.open("w") as log:
+    with log_path.open("w", encoding="utf-8") as log:
         log.write("$ " + " ".join(compile_cmd) + " -c <unit> -o <unit>.o   # x" + str(len(units))
                   + (" (+ " + " ".join(core_flags) + " for the core unit)" if core_flags else "") + "\n")
         log.write("$ " + " ".join([nvcc, "--shared", "-o", str(out_so), "<units>.o"] + link_flags) + "\n\n")
@@ -860,16 +896,16 @@ def _build_units(cmd: list[str], source_dir: Path, out_so: Path, arch: str,
             cached = object_cache_dir / f"{unit.stem}-{_unit_object_key(unit, source_dir, ucmd)}.o"
             if reuse_objects and cached.is_file():
                 os.utime(cached)   # a hit is a use: keeps it out of _prune_object_cache
-                with lock, log_path.open("a") as log:
+                with lock, log_path.open("a", encoding="utf-8") as log:
                     log.write(f"[{unit.stem}] cached {cached.name}\n")
                 return cached, 0, 0.0, ""
         obj = build_dir / (unit.stem + ".o")
         ulog = build_dir / (unit.stem + ".log")
         t0 = time.monotonic()
-        with ulog.open("w") as f:
+        with ulog.open("w", encoding="utf-8") as f:
             r = subprocess.run(ucmd + ["-c", str(unit), "-o", str(obj)], stdout=f, stderr=subprocess.STDOUT)
         secs = time.monotonic() - t0
-        with lock, log_path.open("a") as log:
+        with lock, log_path.open("a", encoding="utf-8") as log:
             log.write(f"[{unit.stem}] rc={r.returncode} {secs:.1f}s\n")
         if r.returncode == 0 and cached is not None:
             # publish atomically (another build may be producing the same key)
@@ -877,7 +913,7 @@ def _build_units(cmd: list[str], source_dir: Path, out_so: Path, arch: str,
             shutil.move(str(obj), str(tmp))
             os.replace(tmp, cached)
             obj = cached
-        return obj, r.returncode, secs, ulog.read_text()
+        return obj, r.returncode, secs, ulog.read_text(encoding="utf-8")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(one, units))
@@ -889,15 +925,20 @@ def _build_units(cmd: list[str], source_dir: Path, out_so: Path, arch: str,
                 f"parallel units (GRID_RBD_BUILD_JOBS=1) or a smaller algorithm_list.\n{out}")
     objs = [str(obj) for obj, _, _, _ in results]
     link = [nvcc, "--shared", "-o", str(out_so)] + objs + link_flags
+    if sys.platform == "win32":
+        link.append("-Xcompiler=/MD")
+        # MSVC exports no plain extern-C functions by default. Export the C ABI
+        # actually defined in the objects (optional surfaces may be compiled out).
+        link.extend(_windows_export_flags(objs))
     t0 = time.monotonic()
-    with log_path.open("a") as log:
+    with log_path.open("a", encoding="utf-8") as log:
         log.write("\n$ " + " ".join(link) + "\n")
         log.flush()
         r = subprocess.run(link, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"[link] rc={r.returncode} {time.monotonic() - t0:.1f}s\n")
     if r.returncode != 0:
         raise RuntimeError(f"The CUDA linker failed (nvcc exit {r.returncode}) while producing this robot's library. The build log "
-            f"follows; retry with force_rebuild=True to recompile every unit.\n" + log_path.read_text())
+            f"follows; retry with force_rebuild=True to recompile every unit.\n" + log_path.read_text(encoding="utf-8"))
     for obj in objs:   # uncached objects: keep the store entry lean
         if object_cache_dir is None or Path(obj).parent != object_cache_dir:
             Path(obj).unlink(missing_ok=True)
@@ -958,8 +999,8 @@ def generate_sources(
     # fenced template (bindings/grid_rbd/_units.py). wrapper.cu stays beside them
     # as the hashed source of truth; the units are what nvcc compiles.
     from . import _units
-    for name, text in _units.split(wrapper.read_text()).items():
-        (target_dir / f"wrapper_{name}.cu").write_text(text)
+    for name, text in _units.split(wrapper.read_text(encoding="utf-8")).items():
+        (target_dir / f"wrapper_{name}.cu").write_text(text, encoding="utf-8")
     return meta
 
 
@@ -976,6 +1017,8 @@ def compile_sources(
     """The nvcc half: compile target_dir's grid.cuh + wrapper units → robot.so
     and persist meta.json. Returns the completed meta dict. ``object_cache_dir``
     / ``reuse_objects`` drive the per-unit object cache (compile_so)."""
+    from grid_codegen.windows import ensure_msvc_environment
+    ensure_msvc_environment()
     cuh_path = target_dir / "grid.cuh"
     wrapper_cu = target_dir / "wrapper.cu"
 
@@ -1032,6 +1075,6 @@ def compile_sources(
     # fp64 (Phase 8): record the element dtype so the handle/Runner picks the
     # matching numpy buffer type (RunnerF64 for float64) without dlopening.
     meta["dtype"] = "float64" if t_double else "float32"
-    (target_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    (target_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     return meta

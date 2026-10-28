@@ -1,0 +1,3 @@
+# Content hashes for URDFs, meshes, generated sources and packaged peers must
+# agree across operating systems, even with core.autocrlf=true on Windows.
+* text=auto eol=lf

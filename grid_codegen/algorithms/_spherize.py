@@ -100,7 +100,7 @@ def _resolve_mesh_path(filename, urdf_dir):
         return None
     if filename.startswith("file://"):
         p = filename[len("file://"):]
-        return p if os.path.exists(p) else None
+        return os.path.normpath(p) if os.path.exists(p) else None
     if filename.startswith("package://"):
         rest = filename[len("package://"):]
         candidates = [os.path.join(urdf_dir, rest),
@@ -113,10 +113,10 @@ def _resolve_mesh_path(filename, urdf_dir):
                 candidates.append(os.path.join(root, relative))
         for c in candidates:
             if os.path.exists(c):
-                return c
+                return os.path.normpath(c)
         return None
     p = filename if os.path.isabs(filename) else os.path.join(urdf_dir, filename)
-    return p if os.path.exists(p) else None
+    return os.path.normpath(p) if os.path.exists(p) else None
 
 
 def _load_mesh(mesh_elem, urdf_dir, link_name):

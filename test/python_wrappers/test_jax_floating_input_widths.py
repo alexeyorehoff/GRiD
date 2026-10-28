@@ -12,6 +12,7 @@ pytestmark = pytest.mark.python_wrappers
 
 @pytest.fixture(scope="module", params=["go2", "g1"])
 def handles(request):
+    pytest.importorskip("jax", reason="jax not installed")
     import grid_rbd
     from grid_assets import robot_urdf
     options = dict(floating_base=True, enable_mujoco_kernels=False, max_batch_size=8,

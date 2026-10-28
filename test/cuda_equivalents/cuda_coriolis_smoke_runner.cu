@@ -48,6 +48,25 @@ void print_flat(const std::string &name, const T *data, int rows, int cols) {
     std::cout << "END " << name << "\n";
 }
 
+template <typename T, int TIER>
+bool launch_coriolis(grid::gridData<T> *data, const grid::robotModel<T> *model,
+                     T gravity, dim3 blocks, dim3 threads, cudaStream_t *streams,
+                     size_t capacity) {
+    const size_t bytes = grid::CORIOLIS_MATRIX_DYNAMIC_SHARED_MEM_BYTES<T, TIER>();
+    cudaFuncAttributes attrs;
+    gpuErrchk(cudaFuncGetAttributes(&attrs, grid::coriolis_matrix_kernel<T, TIER>));
+    if (bytes + attrs.sharedSizeBytes > capacity) return false;
+    gpuErrchk(cudaFuncSetAttribute(grid::coriolis_matrix_kernel<T, TIER>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes));
+#if GRID_CUDA_FLOATING_BASE
+    grid::coriolis_matrix<T, false, grid::GRID_DATA_ALL, false, TIER>(
+#else
+    grid::coriolis_matrix<T, false, grid::GRID_DATA_ALL, TIER>(
+#endif
+        data, model, gravity, 1, blocks, threads, streams);
+    return true;
+}
+
 template <typename T>
 int run(int req_threads) {
     // Unified gravity convention: GRiD and the RBDReference oracle both use -9.81.
@@ -76,9 +95,15 @@ int run(int req_threads) {
     for (int i = 0; i < grid::NUM_JOINTS; ++i) hd_data->h_q_qd[i] = hd_data->h_q_qd_u[i];
     for (int i = 0; i < grid::NUM_VEL; ++i) hd_data->h_q_qd[grid::NUM_JOINTS + i] = hd_data->h_q_qd_u[grid::NUM_POS + i];
 
-    grid::coriolis_matrix<T>(
-        hd_data, d_robot_model, gravity, 1, block_dimms, thread_dimms, streams
-    );
+    size_t capacity = 0;
+    gpuErrchk(grid::grid_get_max_dynamic_shared_memory_bytes(&capacity));
+    if (!launch_coriolis<T, grid::TIER_SHARED>(hd_data, d_robot_model, gravity,
+                                              block_dimms, thread_dimms, streams, capacity) &&
+        !launch_coriolis<T, grid::TIER_LITE>(hd_data, d_robot_model, gravity,
+                                            block_dimms, thread_dimms, streams, capacity) &&
+        !launch_coriolis<T, grid::TIER_MINIMAL>(hd_data, d_robot_model, gravity,
+                                               block_dimms, thread_dimms, streams, capacity))
+        gpuErrchk(cudaErrorInvalidConfiguration);
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaDeviceSynchronize());
 

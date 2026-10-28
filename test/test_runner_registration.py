@@ -42,6 +42,7 @@ CONVERTED = {
     "cuda_idsva_so_world_frame_smoke_runner.cu": {"idsva_so_world_frame"},
     "cuda_centroidal_host_spill_runner.cu": {"com", "ccrba", "energy"},
     "cuda_fd_parameter_gradient_smoke_runner.cu": {"forward_dynamics_parameter_gradient"},
+    "cuda_fd_du_output_spill_runner.cu": {"forward_dynamics_gradient"},
     "cuda_spherical_runner.cu": {"inverse_dynamics", "crba", "minv", "forward_dynamics", "aba",
                                  "inverse_dynamics_gradient", "forward_dynamics_gradient", "fdsva_so"},
     "cuda_eepose_runtime_smoke_runner.cu": set(),

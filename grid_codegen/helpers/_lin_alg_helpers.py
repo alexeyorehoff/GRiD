@@ -128,7 +128,7 @@ def _emit_glass_source_file(self, relative_path):
     if not source_path.exists():
         raise FileNotFoundError("Required GLASS source file is missing: " + str(source_path))
     self.gen_add_code_line("// BEGIN GLASS " + relative_path)
-    for line in source_path.read_text().splitlines():
+    for line in source_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith("#pragma once"):
             continue

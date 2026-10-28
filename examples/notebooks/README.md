@@ -61,6 +61,15 @@ python -c "import grid_rbd, inspect; print(inspect.getfile(grid_rbd))"
 
 Re-run `pip install -e .` from the checkout you want if it points elsewhere.
 
+On native Windows, use [the Windows developer installer](../../docs/windows.md)
+and select this checkout's `.venv/Scripts/python.exe` as the notebook kernel.
+Registration initializes the installed x64 Visual Studio compiler environment
+automatically, including when VS Code or Jupyter starts outside a developer shell.
+Source generation reads and writes UTF-8 independently of the Windows display language.
+Restart existing notebook kernels after updating the package, then use **Run All**.
+Notebooks 01–05 and 07 support the native NumPy/PyTorch CUDA runtime.
+Notebook 06 requires JAX's NVIDIA backend, which is unavailable on native Windows.
+
 ## Running
 
 Open any notebook and *Run All*, or run them headless as smoke tests:

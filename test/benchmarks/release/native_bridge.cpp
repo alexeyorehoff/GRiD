@@ -2,8 +2,25 @@
 // No CUDA headers required. The already-loaded Python handle owns the context.
 #include <chrono>
 #include <cstring>
-#include <dlfcn.h>
 #include <memory>
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <filesystem>
+static constexpr int RTLD_NOW = 0, RTLD_LOCAL = 0;
+static void *dlopen(const char *path, int) {
+  return reinterpret_cast<void *>(LoadLibraryW(std::filesystem::u8path(path).c_str()));
+}
+static void *dlsym(void *handle, const char *name) {
+  return reinterpret_cast<void *>(GetProcAddress(reinterpret_cast<HMODULE>(handle), name));
+}
+static int dlclose(void *handle) {
+  return FreeLibrary(reinterpret_cast<HMODULE>(handle)) ? 0 : -1;
+}
+#else
+#include <dlfcn.h>
+#endif
 
 extern "C" int grid_release_time(const char *library, const char *symbol,
     long long context, const float *q, const float *v, const float *a,

@@ -35,10 +35,8 @@ _grid_rbd      = pytest.importorskip("grid_rbd",      reason="grid-rbd not insta
 _jax           = pytest.importorskip("jax",           reason="jax not installed (pip install grid-rbd[jax])")
 _grid_rbd_jax  = pytest.importorskip("grid_rbd.jax",  reason="grid_rbd.jax import failed")
 
-_URDF = (
-    Path.home()
-    / ".cache/robot_descriptions/drake/manipulation/models/iiwa_description/urdf/iiwa14_primitive_collision.urdf"
-)
+from grid_assets import robot_urdf
+_URDF = robot_urdf("iiwa14")
 if not _URDF.exists():
     pytest.skip(f"iiwa14 URDF fixture not present at {_URDF}", allow_module_level=True)
 

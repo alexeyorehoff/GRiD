@@ -24,10 +24,8 @@ ext_modules = [
         "grid_rbd._core",
         sources=["bindings/src/_core.cpp"],
         cxx_std=17,
-        # The Runner dlopens the per-robot .so; needs to link libdl on Linux.
-        # Windows / macOS use different mechanisms but we're Linux-only in v1
-        # (CUDA's primary platform).
-        libraries=["dl"],
+        extra_compile_args=["/utf-8"] if sys.platform == "win32" else [],
+        libraries=["dl"] if sys.platform.startswith("linux") else [],
     ),
 ]
 

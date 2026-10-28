@@ -41,6 +41,7 @@ from ._cache import (
     _sweep_dead_staging_dirs,
     read_build_inputs,
     stale_hit_reasons,
+    stamp_forced_rebuild,
     store_dir,
     write_build_inputs,
 )
@@ -767,7 +768,7 @@ def warm_robot(
                      else ["entry incomplete (robot.so or meta.json missing)"])
             stale = stale or stale_hit_reasons(entry_dir, identity)
             if not stale:
-                meta = json.loads(meta_path.read_text())
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 manifest_register(cache_dir, name, mapped, meta)
                 return mapped, so_path, meta
             _log.info("grid_rbd: cache pointer for %s rejected (%s); regenerating",
@@ -785,16 +786,27 @@ def warm_robot(
         gen_urdf_path = urdf_p
         if urdf_string is not None:
             gen_urdf_path = gen_dir / "robot.urdf"
-            gen_urdf_path.write_text(urdf_string)
+            gen_urdf_path.write_text(urdf_string, encoding="utf-8")
         meta = generate_sources(gen_urdf_path, code_options, gen_dir)
+        if force_rebuild:
+            stamp_forced_rebuild(gen_dir)
         content_key = compute_content_key(
             gen_dir, code_options, cuda_arch, max_batch_size)
         entry_dir = store_dir(cache_dir, content_key)
         so_path = entry_dir / "robot.so"
-        if so_path.exists() and not force_rebuild:
+        entry_complete = so_path.is_file() and (entry_dir / "meta.json").is_file()
+        if os.name == "nt" and entry_dir.exists() and not entry_complete:
+            # A previous interrupted cleanup may have left a mapped DLL in an
+            # incomplete entry. Repair in a new image without deleting it.
+            stamp_forced_rebuild(gen_dir)
+            content_key = compute_content_key(gen_dir, code_options, cuda_arch, max_batch_size)
+            entry_dir = store_dir(cache_dir, content_key)
+            so_path = entry_dir / "robot.so"
+            entry_complete = so_path.is_file() and (entry_dir / "meta.json").is_file()
+        if entry_complete and not force_rebuild:
             # Identical build already in the store (e.g. a codegen edit whose
             # emitted bytes are unchanged) — generation-only reuse, no nvcc.
-            meta = json.loads((entry_dir / "meta.json").read_text())
+            meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
             if read_build_inputs(entry_dir) is None:
                 write_build_inputs(entry_dir, identity)  # entry predates W05
         else:
@@ -813,14 +825,15 @@ def warm_robot(
                 reuse_objects=not force_rebuild)
             _build_notice_end(name, time.monotonic() - t_build, cache_dir)
             write_build_inputs(gen_dir, identity)  # published with the entry
-            if force_rebuild and entry_dir.exists():
+            if (entry_dir.exists() and os.name != "nt" and
+                    (force_rebuild or not (so_path.is_file() and (entry_dir / "meta.json").is_file()))):
                 _shutil.rmtree(entry_dir)
             try:
                 os.replace(gen_dir, entry_dir)  # atomic publish
             except OSError:
                 # A concurrent builder published the same content first —
                 # theirs is complete (rename is the last step); use it.
-                meta = json.loads((entry_dir / "meta.json").read_text())
+                meta = json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
     finally:
         _shutil.rmtree(gen_dir, ignore_errors=True)  # no-op when published
 

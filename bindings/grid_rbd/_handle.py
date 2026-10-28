@@ -1072,7 +1072,7 @@ class RobotHandle:
         base = "floating" if floating else "fixed"
         path = os.path.join(_launch_configs_dir(), str(robot_key), str(gpu) + ".json")
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 doc = json.load(f)
         except (OSError, ValueError):
             return None

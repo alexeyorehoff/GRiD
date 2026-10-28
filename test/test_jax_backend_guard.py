@@ -17,3 +17,12 @@ def test_gpu_jax_passes_the_guard(monkeypatch):
     from grid_rbd.jax import _require_gpu_backend
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     _require_gpu_backend()
+
+
+def test_cpu_jax_registration_fails_before_compiling(monkeypatch):
+    import grid_rbd.jax as backend
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(backend._grid_rbd, "register_robot",
+                        lambda *args, **kwargs: pytest.fail("CPU JAX started a CUDA build"))
+    with pytest.raises(RuntimeError, match=r"jax\[cuda12\]"):
+        backend.register_robot("cpu_jax_probe", "/unused.urdf")
