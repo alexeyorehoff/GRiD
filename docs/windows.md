@@ -3,7 +3,8 @@
 Use 64-bit Python 3.12, Visual Studio 2022 with **Desktop development with C++**,
 an NVIDIA driver, CUDA Toolkit 12.8, Git, and
 [uv](https://docs.astral.sh/uv/getting-started/installation/).
-The port is being validated on an RTX 2060 SUPER (sm_75), MSVC 14.39 and Windows.
+Validated on 2026-10-29 with an RTX 2060 SUPER (sm_75), MSVC 14.39,
+Python 3.12 and CUDA 12.8 on 64-bit Windows.
 Compilation and execution use Windows executables throughout.
 
 Clone with LF line endings: model/resource fingerprints use the exact source bytes.
@@ -50,6 +51,9 @@ powershell -ExecutionPolicy Bypass -File test/run_windows.ps1 -Lane all
 
 Cold robot builds can take several minutes. `GRID_RBD_BUILD_JOBS` controls the
 parallel wrapper compilation count; set it to `2` on a memory-constrained host.
+Large humanoid models can take over an hour per CUDA translation unit. The build
+log records each unit when it finishes; increasing CPU time in `cicc.exe` or
+`ptxas.exe` indicates that compilation is still active.
 Build logs and cached objects live under the directory returned by
 `grid_rbd._cache.default_cache_dir()`.
 

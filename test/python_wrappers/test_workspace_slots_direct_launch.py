@@ -89,18 +89,24 @@ def _run_arm(backend: str, slots: str | None, out: Path) -> None:
 @pytest.mark.python_wrappers
 @pytest.mark.parametrize("backend", ["jax", "torch"])
 def test_direct_launch_bit_identical_under_reduced_slots(backend):
+    # The child is a fresh interpreter, so the parent suite's optional-backend
+    # guard cannot intercept its registration. Check availability before spawning.
+    if backend == "jax":
+        jax = pytest.importorskip("jax")
+        if jax.default_backend() != "gpu":
+            pytest.skip("JAX NVIDIA GPU backend unavailable (installed JAX is CPU-only)")
     with tempfile.TemporaryDirectory() as td:
         full = Path(td) / "full.npz"
         few = Path(td) / "few.npz"
         _run_arm(backend, None, full)
         _run_arm(backend, "2", few)
-        a, b = np.load(full), np.load(few)
-        assert sorted(a.files) == sorted(b.files)
-        for key in a.files:
-            assert a[key].shape == b[key].shape
-            assert np.array_equal(a[key], b[key]), (
-                f"{backend} {key}: outputs differ between full-slots and "
-                f"slots=2 (max abs diff "
-                f"{np.max(np.abs(a[key] - b[key])):.3e}) — the direct-launch "
-                "grid clamp is broken (workspace aliasing)"
-            )
+        with np.load(full) as a, np.load(few) as b:
+            assert sorted(a.files) == sorted(b.files)
+            for key in a.files:
+                assert a[key].shape == b[key].shape
+                assert np.array_equal(a[key], b[key]), (
+                    f"{backend} {key}: outputs differ between full-slots and "
+                    f"slots=2 (max abs diff "
+                    f"{np.max(np.abs(a[key] - b[key])):.3e}) — the direct-launch "
+                    "grid clamp is broken (workspace aliasing)"
+                )

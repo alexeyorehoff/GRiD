@@ -4,6 +4,7 @@ Batch four with fewer blocks also catches offsetting by blockIdx instead of k.
 These bounded, torque-conditioned states use the existing integrator tolerances.
 """
 from pathlib import Path
+import os
 import subprocess
 
 import numpy as np
@@ -29,7 +30,8 @@ def test_integrator_batch_forces(tmp_path, robot, base):
     arch = _detect_cuda_arch()
     exe, cmd = cached_nvcc_executable(
         [RUNNER_SOURCE, tmp_path / "grid.cuh"],
-        ["-std=c++17", "-O0", "-gencode", f"arch=compute_{arch},code=sm_{arch}"],
+        ["-std=c++17", "-O0", "-DGRID_DEFAULT_RESOURCE_TIER=TIER_MINIMAL",
+         "-gencode", f"arch=compute_{arch},code=sm_{arch}"],
         exe_name="integrator_batch_forces.exe", fallback_dir=tmp_path,
         include_dirs=[Path(__file__).resolve().parents[2] / "external/GLASS/include"],
     )
@@ -60,9 +62,12 @@ def test_integrator_batch_forces(tmp_path, robot, base):
                     model.integrator(q[src].astype(float), v[src].astype(float), u[src].astype(float), dt, **kwargs),
                     model.integrator_gradient(q[src].astype(float), v[src].astype(float), u[src].astype(float), dt, **kwargs),
                 )
-        for threads, blocks in ((1, 1), (32, 2)):
-            result = subprocess.run([str(exe), str(threads), str(blocks), str(int(pattern == "null"))],
-                                    input=stdin, text=True, capture_output=True, timeout=120)
+        # Full slots retain the original two-live-block coverage; one slot
+        # additionally exercises the host clamp and per-block arena reuse.
+        for threads, blocks, slots in ((1, 1, 4), (32, 2, 4), (1, 1, 1), (32, 2, 1)):
+            result = subprocess.run([str(exe), str(threads), str(blocks), str(int(pattern == "null")), str(slots)],
+                                    input=stdin, text=True, capture_output=True, timeout=120,
+                                    env={**os.environ, "GRID_WORKSPACE_TIMESTEP_SLOTS": str(slots)})
             assert result.returncode == 0, (cmd, result.stdout, result.stderr)
             actual = _parse_runner_output(result.stdout)
             for (scheme, k), (x, grad) in expected.items():
@@ -72,4 +77,4 @@ def test_integrator_batch_forces(tmp_path, robot, base):
                     if suffix.endswith("value"):
                         got = got.reshape(-1)
                     _assert_close_scaled(got, oracle, 5e-4, 5e-4,
-                        f"{robot}/{pattern}/{threads}/{blocks}/{scheme}/{suffix}/{k}")
+                        f"{robot}/{pattern}/{threads}/{blocks}/slots{slots}/{scheme}/{suffix}/{k}")

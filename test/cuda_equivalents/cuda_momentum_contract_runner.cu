@@ -21,6 +21,18 @@ void check(cudaError_t error) {
 
 template<bool MJX>
 void run(const std::vector<T>& input, int threads) {
+    const auto bytes = grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T, TEST_TIER>();
+    int device = 0, cap = 0;
+    check(cudaGetDevice(&device));
+    check(cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    cudaFuncAttributes attributes;
+    check(cudaFuncGetAttributes(&attributes, grid_plant::momentum_cost_kernel<T, MJX, TEST_TIER>));
+    const size_t required = bytes + attributes.sharedSizeBytes;
+    if (required > static_cast<size_t>(cap)) {
+        std::cerr << "GRID shared-memory request for momentum_cost is " << required
+                  << " bytes, but this device supports " << cap << " bytes per block\n";
+        std::exit(77);
+    }
     auto* model = grid::init_robotModel<T>();
     T *in = nullptr, *out = nullptr;
     unsigned char *workspace = nullptr;
@@ -30,7 +42,6 @@ void run(const std::vector<T>& input, int threads) {
     check(cudaMalloc(&workspace, grid::GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()));
     check(cudaMemset(workspace, 0, grid::GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()));
     check(cudaMemcpy(in, input.data(), input.size()*sizeof(T), cudaMemcpyHostToDevice));
-    const auto bytes = grid::DCCRBA_DYNAMIC_SHARED_MEM_BYTES<T, TEST_TIER>();
     check(cudaFuncSetAttribute(grid_plant::momentum_cost_kernel<T, MJX, TEST_TIER>,
                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     grid_plant::momentum_cost_kernel<T, MJX, TEST_TIER><<<1, threads, bytes>>>(

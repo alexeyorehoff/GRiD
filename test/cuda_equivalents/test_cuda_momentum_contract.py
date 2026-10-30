@@ -2,8 +2,10 @@
 
 Every manifest robot on both bases (widened 2026-10-15; the momentum_cost kernel
 is emitted for mimic robots too, and the dccrba arena it launches with fits the
-per-block cap at both (dtype, tier) points: at most 75440 bytes in float at
+96 KiB target at both (dtype, tier) points: at most 75440 bytes in float at
 TIER_SHARED and 37312 bytes in double at TIER_MINIMAL, both on h1_2-floating).
+The runner measures the actual device cap; an explicit tier exceeding it is
+reported separately from numerical failures.
 Narrow with GRID_CUDA_MOMENTUM_ROBOTS="iiwa14:fixed,go2:floating".
 """
 import contextlib
@@ -86,6 +88,10 @@ def test_full_momentum_contract(tmp_path, robot, base, dtype, tier):
             for threads in (32, 128):
                 result = subprocess.run([str(exe), str(int(mjx)), str(threads)],
                                         input=data, text=True, capture_output=True)
+                if result.returncode == 77:
+                    assert "GRID shared-memory request for momentum_cost" in result.stderr
+                    assert "this device supports" in result.stderr
+                    pytest.skip(result.stderr.strip())
                 assert result.returncode == 0, result.stderr
                 out = np.fromstring(result.stdout, sep=" ")
                 assert out.size == 1 + 2*nv + 4*nv*nv, result.stdout

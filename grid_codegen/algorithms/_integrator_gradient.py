@@ -1447,8 +1447,12 @@ def gen_integrator_gradient_kernel(self, compute_x_kp1=False, single_call_timing
             self.gen_kernel_load_inputs("q_qd_u",str(input_count),stride="stride_q_qd_u")
             _emit_mjx_input_convert()
             self.gen_add_code_line("// compute — the orchestration inner owns its FD-grad s_temp pool placement")
-            _emit_spill_pointers("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()")
-            _emit_device_call("k * GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()", "d_f_ext_k")
+            # The arena can hold fewer slots than samples. Each block reuses
+            # its slot as k advances through the grid-stride loop; only inputs
+            # and outputs are indexed by the sample number.
+            slot = "grid_workspace_slot()*GRID_WORKSPACE_BYTES_PER_TIMESTEP<T>()"
+            _emit_spill_pointers(slot)
+            _emit_device_call(slot, "d_f_ext_k")
             self.gen_add_sync()
             self.gen_kernel_save_result("dAB",str(2 * n * 3 * n),stride=str(2 * n * 3 * n), sync=not compute_x_kp1)
             if compute_x_kp1:

@@ -54,6 +54,10 @@ def test_backend_register_forwards_to_the_numpy_root(monkeypatch, backend):
         pytest.importorskip("torch")
     # The backend calls `_grid_rbd.register_robot` (the package attribute).
     monkeypatch.setattr(grid_rbd, "register_robot", _stub)
+    if backend == "jax":
+        # This unit checks forwarding with a stubbed handle, independently of
+        # the real CUDA backend precondition covered by test_jax_backend_guard.
+        monkeypatch.setattr(mod, "_require_gpu_backend", lambda: None)
     with pytest.raises(_Captured) as ei:
         mod.register_robot("fwd_probe", "/nonexistent/robot.urdf", **_MATERIAL)
     got = ei.value.kwargs

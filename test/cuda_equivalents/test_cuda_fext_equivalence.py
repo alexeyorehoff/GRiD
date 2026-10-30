@@ -104,6 +104,10 @@ def _gen_and_compile(proj, build_dir, floating_base):
     exe = build_dir / "cuda_fext_runner.exe"
     cmd = [
         nvcc, "-std=c++11", "-O0",
+        # Validate forces using the existing workspace rung on every robot.
+        # H1's default FD arena exceeds 64 KiB; its smaller rung runs the same
+        # dynamics and retains all three independent numerical comparisons.
+        "-DGRID_DEFAULT_RESOURCE_TIER=TIER_MINIMAL",
         "-DGRID_RUN_SPLIT",
         "-DRUN_INVERSE_DYNAMICS=1", "-DRUN_FORWARD_DYNAMICS=1", "-DRUN_ABA=1",
         "-DRUN_INVERSE_DYNAMICS_GRADIENT=1", "-DRUN_FORWARD_DYNAMICS_GRADIENT=1",

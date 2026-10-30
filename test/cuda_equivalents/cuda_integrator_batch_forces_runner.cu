@@ -45,7 +45,7 @@ void evaluate(const std::string &name, grid::gridData<T> *data,
 }
 
 template <typename T>
-void run(int nthreads, int nblocks, bool null_forces) {
+void run(int nthreads, int nblocks, bool null_forces, int expected_slots) {
     constexpr int B = 4, NQ = grid::NUM_POS, NV = grid::NUM_VEL, NF = 6*grid::NUM_BODIES;
     auto *streams = grid::init_grid_streams<T>();
     gpuErrchk(grid::init_grid_kernel_attr_integrator_checked<T>());
@@ -53,6 +53,10 @@ void run(int nthreads, int nblocks, bool null_forces) {
     gpuErrchk(grid::init_grid_kernel_attr_integrator_with_gradient_checked<T>());
     auto *model = grid::init_robotModel<T>();
     auto *data = grid::init_gridData<T, B>();
+    if (data->workspace_timestep_slots != expected_slots) {
+        std::cerr << "Unexpected workspace slot count\n";
+        std::exit(3);
+    }
     for (int k = 0; k < B; ++k) {
         T *row = data->h_q_qd_u + k*3*NQ;
         for (int j = 0; j < 3*NQ; ++j) row[j] = T(0);
@@ -78,6 +82,6 @@ void run(int nthreads, int nblocks, bool null_forces) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) return 2;
-    run<float>(std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]) != 0);
+    if (argc != 5) return 2;
+    run<float>(std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3]) != 0, std::atoi(argv[4]));
 }

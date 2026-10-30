@@ -31,9 +31,20 @@ def _sanitizer():
     nvcc = shutil.which("nvcc")
     if nvcc is None:
         pytest.skip("nvcc not on PATH")
-    cs = Path(nvcc).resolve().parent / "compute-sanitizer"
-    assert cs.exists(), f"compute-sanitizer ships with the CUDA toolkit but is missing at {cs}"
-    return str(cs)
+    toolkit_bin = Path(nvcc).resolve().parent
+    # Windows ships a .bat shim in bin/ and the executable in a sibling
+    # compute-sanitizer/ directory. Invoke the executable directly.
+    candidates = (
+        toolkit_bin / "compute-sanitizer",
+        toolkit_bin / "compute-sanitizer.exe",
+        toolkit_bin.parent / "compute-sanitizer" / "compute-sanitizer.exe",
+    )
+    for cs in candidates:
+        if cs.is_file():
+            return str(cs)
+    raise AssertionError(
+        f"compute-sanitizer ships with the CUDA toolkit but is missing; checked {candidates}"
+    )
 
 
 @pytest.mark.cuda_equivalence
@@ -56,7 +67,8 @@ def test_go2_floating_composition_is_racecheck_clean(tmp_path):
     for threads in (32, 256):
         r = subprocess.run([cs, "--tool", "racecheck", "--print-limit", "50", str(exe), str(threads)],
                            capture_output=True, text=True, cwd=tmp_path)
-        if RACECHECK_UNSUPPORTED in r.stdout:
+        output = r.stdout + "\n" + r.stderr
+        if RACECHECK_UNSUPPORTED in output:
             # The sanitizer's racecheck tool needs the GPU debugger interface,
             # which the Jetson integrated GPUs do not expose (Orin, sm_87, CUDA
             # 13.2: the runner still prints OK, and the sanitizer counts its own
@@ -66,5 +78,5 @@ def test_go2_floating_composition_is_racecheck_clean(tmp_path):
             # receipt baseline stays empty.
             pytest.skip(f"compute-sanitizer racecheck is unsupported on this GPU: {RACECHECK_UNSUPPORTED}")
         assert r.returncode == 0 and "OK" in r.stdout, f"runner failed at {threads} threads:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}"
-        assert "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)" in r.stdout, \
-            f"racecheck hazards at {threads} threads:\n{r.stdout[-6000:]}"
+        assert "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)" in output, \
+            f"racecheck hazards at {threads} threads:\n{output[-6000:]}"

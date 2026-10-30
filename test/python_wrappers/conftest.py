@@ -39,7 +39,7 @@ def _optional_jax_gpu_backend(request):
     if jax.default_backend() == "gpu":
         yield
         return
-    if Path(request.module.__file__).name == "test_iiwa14_jax_smoke.py":
+    if Path(request.module.__file__).name in {"test_iiwa14_jax_smoke.py", "test_joint_dynamics_ffi.py"}:
         pytest.skip("JAX NVIDIA GPU backend unavailable (installed JAX is CPU-only)")
     import grid_rbd.jax as backend
     with pytest.MonkeyPatch.context() as patch:

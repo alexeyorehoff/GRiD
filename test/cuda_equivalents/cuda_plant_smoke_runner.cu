@@ -959,19 +959,22 @@ void run() {
         for (int i = 0; i < NV; ++i) h_x[NQ + i] = h_qd[i];
         cudaMemcpy(g_x, h_x.data(), NX * sizeof(T), cudaMemcpyHostToDevice);
 
-        const size_t h2_smem = grid_plant::INTEGRATOR_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T>();
+        // The FR3 shared Hessian arena exceeds 64 KiB. Exercise the existing
+        // workspace tier while retaining the same Hessian/reference checks.
+        constexpr int h2_tier = grid::TIER_MINIMAL;
+        const size_t h2_smem = grid_plant::INTEGRATOR_HESSIAN_DYNAMIC_SHARED_MEM_BYTES<T, h2_tier>();
         unsigned char *g_h2_ws = nullptr;
         if (grid_plant::GRID_PLANT_HESSIAN_USES_WORKSPACE_ANY_TIER) {
             cudaMalloc(&g_h2_ws, grid_plant::PLANT_HESSIAN_WORKSPACE_BYTES_PER_TIMESTEP<T>());
         }
-        cudaFuncSetAttribute(grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::EULER>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)h2_smem);
-        cudaFuncSetAttribute(grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::SEMI_IMPLICIT_EULER>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)h2_smem);
-        grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::EULER><<<1, nthreads, h2_smem>>>(
+        gpuErrchk(cudaFuncSetAttribute(grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::EULER, h2_tier>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)h2_smem));
+        gpuErrchk(cudaFuncSetAttribute(grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::SEMI_IMPLICIT_EULER, h2_tier>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)h2_smem));
+        grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::EULER, h2_tier><<<1, nthreads, h2_smem>>>(
             o_h2_eu, g_h2_ws, g_x, g_u, NX, NU, d_robotModel, gravity, dt, 1);
         gpuErrchkKernel();
-        grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::SEMI_IMPLICIT_EULER><<<1, nthreads, h2_smem>>>(
+        grid_plant::plant_step_hessian_kernel<T, grid::IntegratorType::SEMI_IMPLICIT_EULER, h2_tier><<<1, nthreads, h2_smem>>>(
             o_h2_si, g_h2_ws, g_x, g_u, NX, NU, d_robotModel, gravity, dt, 1);
         gpuErrchkKernel();
         if (g_h2_ws) cudaFree(g_h2_ws);
